@@ -31,6 +31,11 @@ let configReadyResolve;
 const configReady = new Promise((r) => (configReadyResolve = r));
 let outputAudioContext = null;
 let audioSource = null;
+let systemAudioEnabled = false;
+let systemAudioStream = null;
+let systemAudioSource = null;
+let mixerGain = null;
+let mixedDestination = null;
 
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
@@ -49,6 +54,31 @@ const downloadBtn = document.getElementById("downloadTranscript");
 
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsDiv = document.querySelector(".settings");
+const systemAudioToggle = document.getElementById("systemAudioToggle");
+const systemAudioLabel = document.getElementById("systemAudioLabel");
+const systemAudioBadge = document.getElementById("systemAudioBadge");
+
+// Restore saved system audio preference
+if (systemAudioToggle) {
+  const savedSystemAudio = localStorage.getItem("systemAudioEnabled") === "true";
+  systemAudioToggle.checked = savedSystemAudio;
+  systemAudioEnabled = savedSystemAudio;
+  if (systemAudioLabel) systemAudioLabel.textContent = savedSystemAudio ? "On" : "Off";
+
+  systemAudioToggle.addEventListener("change", () => {
+    systemAudioEnabled = systemAudioToggle.checked;
+    localStorage.setItem("systemAudioEnabled", systemAudioEnabled);
+    if (systemAudioLabel) systemAudioLabel.textContent = systemAudioEnabled ? "On" : "Off";
+    if (isRecording) {
+      statusText.textContent = "System audio change will take effect on next recording.";
+    }
+  });
+}
+
+// Hide system audio toggle in extension context (extensions use tabCapture)
+if (isExtension && systemAudioToggle) {
+  systemAudioToggle.closest('.field').style.display = 'none';
+}
 
 // if (isExtension) {
 //   chrome.runtime.onInstalled.addListener((details) => {
@@ -573,11 +603,60 @@ async function startRecording() {
       stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
     }
 
+    // Capture system audio if enabled (web context only)
+    let systemStream = null;
+    if (systemAudioEnabled && isWebContext) {
+      try {
+        systemStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+        // Discard video track -- we only need audio
+        systemStream.getVideoTracks().forEach(track => track.stop());
+        if (systemStream.getAudioTracks().length === 0) {
+          console.warn("getDisplayMedia returned no audio tracks.");
+          statusText.textContent = "No system audio available. Using microphone only.";
+          systemStream = null;
+        }
+      } catch (displayErr) {
+        console.log("System audio capture cancelled or failed:", displayErr.name);
+        statusText.textContent = "System audio cancelled. Using microphone only.";
+        systemStream = null;
+      }
+    }
+
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
     microphone = audioContext.createMediaStreamSource(stream);
-    microphone.connect(analyser);
+
+    // Create mixer -- all sources connect here
+    mixerGain = audioContext.createGain();
+    mixerGain.gain.value = 1.0;
+    microphone.connect(mixerGain);
+
+    // If system audio was captured, add it to the mix
+    if (systemStream) {
+      systemAudioStream = systemStream;
+      systemAudioSource = audioContext.createMediaStreamSource(systemStream);
+      systemAudioSource.connect(mixerGain);
+      if (systemAudioBadge) systemAudioBadge.classList.add("active");
+      // Graceful degradation if user stops sharing
+      systemStream.getAudioTracks().forEach(track => {
+        track.addEventListener("ended", () => {
+          console.log("System audio track ended (user stopped sharing).");
+          if (systemAudioSource) {
+            try { systemAudioSource.disconnect(); } catch (e) {}
+            systemAudioSource = null;
+          }
+          systemAudioStream = null;
+          if (systemAudioBadge) systemAudioBadge.classList.remove("active");
+          statusText.textContent = "System audio stopped. Continuing with microphone.";
+        });
+      });
+    }
+
+    mixerGain.connect(analyser);
 
     if (serverUseAudioWorklet) {
       if (!audioContext.audioWorklet) {
@@ -585,7 +664,7 @@ async function startRecording() {
       }
       await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");
       workletNode = new AudioWorkletNode(audioContext, "pcm-forwarder", { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
-      microphone.connect(workletNode);
+      mixerGain.connect(workletNode);
 
       recorderWorker = new Worker("/web/recorder_worker.js");
       recorderWorker.postMessage({
@@ -613,10 +692,14 @@ async function startRecording() {
         );
       };
     } else {
+      // For MediaRecorder, create a stream from the mixer output
+      mixedDestination = audioContext.createMediaStreamDestination();
+      mixerGain.connect(mixedDestination);
+      const recorderStream = mixedDestination.stream;
       try {
-        recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+        recorder = new MediaRecorder(recorderStream, { mimeType: "audio/webm" });
       } catch (e) {
-        recorder = new MediaRecorder(stream);
+        recorder = new MediaRecorder(recorderStream);
       }
       recorder.ondataavailable = (e) => {
         if (websocket && websocket.readyState === WebSocket.OPEN) {
@@ -692,6 +775,25 @@ async function stopRecording() {
     microphone = null;
   }
 
+  // Clean up system audio
+  if (systemAudioStream) {
+    systemAudioStream.getTracks().forEach(track => track.stop());
+    systemAudioStream = null;
+  }
+  if (systemAudioSource) {
+    try { systemAudioSource.disconnect(); } catch (e) {}
+    systemAudioSource = null;
+  }
+  if (mixerGain) {
+    try { mixerGain.disconnect(); } catch (e) {}
+    mixerGain = null;
+  }
+  if (mixedDestination) {
+    try { mixedDestination.disconnect(); } catch (e) {}
+    mixedDestination = null;
+  }
+  if (systemAudioBadge) systemAudioBadge.classList.remove("active");
+
   if (analyser) {
     analyser = null;
   }
@@ -760,6 +862,9 @@ async function toggleRecording() {
 function updateUI() {
   recordButton.classList.toggle("recording", isRecording);
   recordButton.disabled = waitingForStop;
+  if (systemAudioToggle) {
+    systemAudioToggle.disabled = isRecording || waitingForStop;
+  }
 
   if (waitingForStop) {
     if (statusText.textContent !== "Recording stopped. Processing final audio...") {

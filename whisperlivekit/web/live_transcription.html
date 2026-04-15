@@ -24,6 +24,11 @@
                     </div>
                 </button>
 
+                <span id="systemAudioBadge" class="system-audio-badge">
+                    <span class="system-audio-dot"></span>
+                    System Audio
+                </span>
+
                 <button id="settingsToggle" class="settings-toggle" title="Show/hide settings">
                     <img src="web/src/settings.svg" alt="Settings" />
                 </button>
@@ -40,6 +45,15 @@
                     <select id="microphoneSelect">
                         <option value="">Default Microphone</option>
                     </select>
+                </div>
+
+                <div class="field">
+                    <label for="systemAudioToggle">System Audio</label>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="systemAudioToggle" />
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-label" id="systemAudioLabel">Off</span>
+                    </label>
                 </div>
 
                 <div class="theme-selector-container">

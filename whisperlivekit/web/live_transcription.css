@@ -647,3 +647,78 @@ label {
 .download-btn:hover {
   opacity: 0.7;
 }
+
+/* System audio toggle switch */
+.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle-switch input {
+  display: none;
+}
+
+.toggle-slider {
+  width: 36px;
+  height: 20px;
+  background-color: var(--border);
+  border-radius: 10px;
+  position: relative;
+  transition: background-color 0.2s ease;
+}
+
+.toggle-slider::after {
+  content: '';
+  width: 16px;
+  height: 16px;
+  background-color: var(--button-bg);
+  border-radius: 50%;
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  transition: transform 0.2s ease;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background-color: rgb(209, 61, 53);
+}
+
+.toggle-switch input:checked + .toggle-slider::after {
+  transform: translateX(16px);
+}
+
+.toggle-label {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* System audio active indicator badge */
+.system-audio-badge {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: rgb(209, 61, 53);
+  margin-left: 8px;
+  white-space: nowrap;
+}
+
+.system-audio-badge.active {
+  display: inline-flex;
+}
+
+.system-audio-dot {
+  width: 6px;
+  height: 6px;
+  background-color: rgb(209, 61, 53);
+  border-radius: 50%;
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
