@@ -225,9 +225,15 @@ async def handle_deepgram_websocket(websocket: WebSocket, transcription_engine, 
     language = params.get("language", None)
     vad_events = params.get("vad_events", "false").lower() == "true"
 
+    transcript_writer = None
+    if hasattr(config, 'save_transcript') and config.save_transcript:
+        from whisperlivekit.transcript_writer import TranscriptWriter
+        transcript_writer = TranscriptWriter(output_dir=config.transcript_dir)
+
     audio_processor = AudioProcessor(
         transcription_engine=transcription_engine,
         language=language,
+        transcript_writer=transcript_writer,
     )
 
     await websocket.accept()

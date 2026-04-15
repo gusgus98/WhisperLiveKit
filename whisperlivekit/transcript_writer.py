@@ -9,6 +9,7 @@ Produces two files per session:
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -25,7 +26,9 @@ class TranscriptWriter:
 
     def __init__(self, output_dir: str, session_id: Optional[str] = None) -> None:
         self.output_dir = Path(output_dir)
-        self.session_id = session_id or datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+        self.session_id = session_id or (
+            datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S") + "-" + uuid.uuid4().hex[:8]
+        )
         self.start_time = datetime.now(timezone.utc).isoformat()
         self._last_front_data: Optional[FrontData] = None
         self._last_write_time: float = 0.0

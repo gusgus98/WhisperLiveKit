@@ -655,8 +655,11 @@ class AudioProcessor:
             self.diarization.close()
 
         if self.transcript_writer:
-            duration = self.total_pcm_samples / self.sample_rate
-            self.transcript_writer.finalize(duration)
+            try:
+                duration = self.total_pcm_samples / self.sample_rate
+                self.transcript_writer.finalize(duration)
+            except Exception as e:
+                logger.warning(f"Error finalizing transcript: {e}")
 
         # Finalize session metrics
         self.metrics.total_audio_duration_s = self.total_pcm_samples / self.sample_rate

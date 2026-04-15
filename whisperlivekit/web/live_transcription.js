@@ -331,7 +331,7 @@ function setupWebSocket() {
         recordButton.disabled = false;
 
         if (data.session_id) {
-          const baseUrl = websocketUrl.replace(/^ws(s?):\/\//, "http$1://").replace(/\/asr$/, "");
+          const baseUrl = websocketUrl.replace(/^ws(s?):\/\//, "http$1://").replace(/\?.*$/, "").replace(/\/asr$/, "");
           downloadBtn.href = baseUrl + "/transcript/" + data.session_id;
           downloadBtn.download = data.session_id + ".json";
           downloadBtn.style.display = "inline-block";

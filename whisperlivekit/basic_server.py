@@ -358,12 +358,18 @@ async def get_transcript(session_id: str):
     if not re.match(r'^[\w\-]+$', session_id):
         return JSONResponse({"error": "Invalid session ID"}, status_code=400)
 
-    transcript_path = Path(config.transcript_dir) / f"{session_id}.json"
-    if not transcript_path.exists():
+    transcript_dir = Path(config.transcript_dir)
+    final_path = transcript_dir / f"{session_id}.json"
+    partial_path = transcript_dir / f"{session_id}.partial.json"
+
+    # Serve final file if ready, otherwise fall back to partial
+    # (finalize() may not have run yet when the client requests this)
+    serve_path = final_path if final_path.exists() else partial_path
+    if not serve_path.exists():
         return JSONResponse({"error": "Transcript not found"}, status_code=404)
 
     return FileResponse(
-        path=str(transcript_path),
+        path=str(serve_path),
         filename=f"{session_id}.json",
         media_type="application/json",
     )

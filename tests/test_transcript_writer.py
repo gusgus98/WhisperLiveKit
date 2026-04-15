@@ -147,14 +147,22 @@ class TestTranscriptWriterFinalize:
 class TestTranscriptWriterSessionId:
     """Tests for session ID generation."""
 
-    def test_default_session_id_is_timestamp(self, tmp_path):
+    def test_default_session_id_is_timestamp_with_suffix(self, tmp_path):
         from whisperlivekit.transcript_writer import TranscriptWriter
 
         writer = TranscriptWriter(output_dir=str(tmp_path))
-        # Should be formatted like 2026-04-15_14-30-22
-        assert len(writer.session_id) == 19
+        # Should be formatted like 2026-04-15_14-30-22-abcd1234 (28 chars)
+        assert len(writer.session_id) == 28
         assert writer.session_id[4] == "-"
         assert writer.session_id[10] == "_"
+        assert writer.session_id[19] == "-"
+
+    def test_concurrent_sessions_get_unique_ids(self, tmp_path):
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        w1 = TranscriptWriter(output_dir=str(tmp_path))
+        w2 = TranscriptWriter(output_dir=str(tmp_path))
+        assert w1.session_id != w2.session_id
 
     def test_creates_output_dir(self, tmp_path):
         from whisperlivekit.transcript_writer import TranscriptWriter
