@@ -628,3 +628,22 @@ label {
   font-weight: 800;
   color: var(--muted);
 }
+
+/* Download transcript button */
+.download-btn {
+  display: inline-block;
+  padding: 6px 16px;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--button-bg);
+  color: var(--text);
+  font-size: 13px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.download-btn:hover {
+  opacity: 0.7;
+}

@@ -45,6 +45,7 @@ const linesTranscriptDiv = document.getElementById("linesTranscript");
 const timerElement = document.querySelector(".timer");
 const themeRadios = document.querySelectorAll('input[name="theme"]');
 const microphoneSelect = document.getElementById("microphoneSelect");
+const downloadBtn = document.getElementById("downloadTranscript");
 
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsDiv = document.querySelector(".settings");
@@ -224,6 +225,7 @@ function setupWebSocket() {
 
     websocket.onopen = () => {
       statusText.textContent = "Connected to server.";
+      downloadBtn.style.display = "none";
       resolve();
     };
 
@@ -297,6 +299,13 @@ function setupWebSocket() {
         }
         statusText.textContent = "Finished processing audio! Ready to record again.";
         recordButton.disabled = false;
+
+        if (data.session_id) {
+          const baseUrl = websocketUrl.replace(/^ws(s?):\/\//, "http$1://").replace(/\/asr$/, "");
+          downloadBtn.href = baseUrl + "/transcript/" + data.session_id;
+          downloadBtn.download = data.session_id + ".json";
+          downloadBtn.style.display = "inline-block";
+        }
 
         if (websocket) {
           websocket.close();
