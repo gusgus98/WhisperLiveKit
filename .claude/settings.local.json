@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run *)",
+      "Bash(pip3 install *)",
+      "Bash(apt list *)",
+      "Read(//usr/local/bin/**)",
+      "Read(//usr/bin/**)",
+      "Read(//home/**)",
+      "Bash(/home/gusobenitez/whisper-env/bin/python -m pytest --version)",
+      "Bash(/home/gusobenitez/whisper-env/bin/pip install *)",
+      "Bash(/home/gusobenitez/whisper-env/bin/python *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(/home/gusobenitez/miniconda3/envs/whisper-env/bin/python -m pytest tests/test_transcript_writer.py -v)",
+      "Bash(conda run *)"
+    ]
+  }
+}
