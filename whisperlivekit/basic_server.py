@@ -22,7 +22,37 @@ transcription_engine = None
 async def lifespan(app: FastAPI):
     global transcription_engine
     transcription_engine = TranscriptionEngine(config=config)
+    if config.save_transcript:
+        _register_transcript_endpoint(app)
     yield
+
+
+def _register_transcript_endpoint(app: FastAPI):
+    """Register GET /transcript/{session_id} only when saving is enabled."""
+    import re
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+
+    @app.get("/transcript/{session_id}")
+    async def get_transcript(session_id: str):
+        """Download a saved transcript JSON file."""
+        if not re.match(r'^[\w\-]+$', session_id):
+            return JSONResponse({"error": "Invalid session ID"}, status_code=400)
+
+        transcript_dir = Path(config.transcript_dir)
+        final_path = transcript_dir / f"{session_id}.json"
+        partial_path = transcript_dir / f"{session_id}.partial.json"
+
+        serve_path = final_path if final_path.exists() else partial_path
+        if not serve_path.exists():
+            return JSONResponse({"error": "Transcript not found"}, status_code=404)
+
+        return FileResponse(
+            path=str(serve_path),
+            filename=f"{session_id}.json",
+            media_type="application/json",
+        )
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -344,35 +374,6 @@ async def list_models():
             "owned_by": "whisperlivekit",
         }],
     })
-
-
-@app.get("/transcript/{session_id}")
-async def get_transcript(session_id: str):
-    """Download a saved transcript JSON file."""
-    import re
-    from pathlib import Path
-
-    from fastapi.responses import FileResponse
-
-    # Validate session_id to prevent path traversal
-    if not re.match(r'^[\w\-]+$', session_id):
-        return JSONResponse({"error": "Invalid session ID"}, status_code=400)
-
-    transcript_dir = Path(config.transcript_dir)
-    final_path = transcript_dir / f"{session_id}.json"
-    partial_path = transcript_dir / f"{session_id}.partial.json"
-
-    # Serve final file if ready, otherwise fall back to partial
-    # (finalize() may not have run yet when the client requests this)
-    serve_path = final_path if final_path.exists() else partial_path
-    if not serve_path.exists():
-        return JSONResponse({"error": "Transcript not found"}, status_code=404)
-
-    return FileResponse(
-        path=str(serve_path),
-        filename=f"{session_id}.json",
-        media_type="application/json",
-    )
 
 
 def main():

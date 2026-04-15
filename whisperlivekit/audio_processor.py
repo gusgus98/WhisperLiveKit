@@ -654,7 +654,7 @@ class AudioProcessor:
         if self.diarization:
             self.diarization.close()
 
-        if self.transcript_writer:
+        if self.transcript_writer and self.total_pcm_samples > 0:
             try:
                 duration = self.total_pcm_samples / self.sample_rate
                 self.transcript_writer.finalize(duration)

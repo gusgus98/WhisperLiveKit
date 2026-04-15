@@ -5,6 +5,8 @@ PUNCTUATION_MARKS = {'.', '!', '?', '。', '！', '？'}
 
 def format_time(seconds: float) -> str:
     """Format seconds as H:MM:SS.cc (centisecond precision)."""
+    if seconds < 0:
+        seconds = 0.0
     total_cs = int(round(seconds * 100))
     cs = total_cs % 100
     total_s = total_cs // 100

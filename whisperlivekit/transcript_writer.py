@@ -37,7 +37,7 @@ class TranscriptWriter:
         """Extract speech segments (skip silence) from FrontData lines."""
         segments = []
         for line in front_data.lines:
-            if line.speaker == -2 or not line.text:
+            if line.speaker == -2 or not line.text or not line.text.strip():
                 continue
             segments.append({
                 "start": format_time(line.start),
