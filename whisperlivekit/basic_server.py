@@ -50,7 +50,7 @@ async def health():
     })
 
 
-async def handle_websocket_results(websocket, results_generator, diff_tracker=None):
+async def handle_websocket_results(websocket, results_generator, diff_tracker=None, session_id=None):
     """Consumes results from the audio processor and sends them via WebSocket."""
     try:
         async for response in results_generator:
@@ -60,7 +60,10 @@ async def handle_websocket_results(websocket, results_generator, diff_tracker=No
                 await websocket.send_json(response.to_dict())
         # when the results_generator finishes it means all audio has been processed
         logger.info("Results generator finished. Sending 'ready_to_stop' to client.")
-        await websocket.send_json({"type": "ready_to_stop"})
+        stop_msg = {"type": "ready_to_stop"}
+        if session_id:
+            stop_msg["session_id"] = session_id
+        await websocket.send_json(stop_msg)
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected while handling results (client likely closed connection).")
     except Exception as e:
@@ -75,10 +78,6 @@ async def websocket_endpoint(websocket: WebSocket):
     session_language = websocket.query_params.get("language", None)
     mode = websocket.query_params.get("mode", "full")
 
-    audio_processor = AudioProcessor(
-        transcription_engine=transcription_engine,
-        language=session_language,
-    )
     await websocket.accept()
     logger.info(
         "WebSocket connection opened.%s",
@@ -90,13 +89,27 @@ async def websocket_endpoint(websocket: WebSocket):
         diff_tracker = DiffTracker()
         logger.info("Client requested diff mode")
 
+    transcript_writer = None
+    session_id = None
+    if config.save_transcript:
+        from whisperlivekit.transcript_writer import TranscriptWriter
+        transcript_writer = TranscriptWriter(output_dir=config.transcript_dir)
+        session_id = transcript_writer.session_id
+        logger.info("Transcript saving enabled: %s/%s", config.transcript_dir, session_id)
+
+    audio_processor = AudioProcessor(
+        transcription_engine=transcription_engine,
+        language=session_language,
+        transcript_writer=transcript_writer,
+    )
+
     try:
         await websocket.send_json({"type": "config", "useAudioWorklet": bool(config.pcm_input), "mode": mode})
     except Exception as e:
         logger.warning(f"Failed to send config to client: {e}")
 
     results_generator = await audio_processor.create_tasks()
-    websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator, diff_tracker))
+    websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator, diff_tracker, session_id=session_id))
 
     try:
         while True:
@@ -331,6 +344,29 @@ async def list_models():
             "owned_by": "whisperlivekit",
         }],
     })
+
+
+@app.get("/transcript/{session_id}")
+async def get_transcript(session_id: str):
+    """Download a saved transcript JSON file."""
+    import re
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+
+    # Validate session_id to prevent path traversal
+    if not re.match(r'^[\w\-]+$', session_id):
+        return JSONResponse({"error": "Invalid session ID"}, status_code=400)
+
+    transcript_path = Path(config.transcript_dir) / f"{session_id}.json"
+    if not transcript_path.exists():
+        return JSONResponse({"error": "Transcript not found"}, status_code=404)
+
+    return FileResponse(
+        path=str(transcript_path),
+        filename=f"{session_id}.json",
+        media_type="application/json",
+    )
 
 
 def main():
