@@ -4,6 +4,7 @@ from .core import TranscriptionEngine
 from .parse_args import parse_args
 from .test_client import TranscriptionResult, transcribe_audio
 from .test_harness import TestHarness, TestState
+from .transcript_writer import TranscriptWriter
 from .web.web_interface import get_inline_ui_html, get_web_interface_html
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "TranscriptionResult",
     "TestHarness",
     "TestState",
+    "TranscriptWriter",
     "get_web_interface_html",
     "get_inline_ui_html",
 ]
