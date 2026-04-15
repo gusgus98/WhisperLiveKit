@@ -61,6 +61,7 @@ class AudioProcessor:
         """Initialize the audio processor with configuration, models, and state."""
         # Extract per-session language override before passing to TranscriptionEngine
         session_language = kwargs.pop('language', None)
+        self.transcript_writer = kwargs.pop('transcript_writer', None)
 
         if 'transcription_engine' in kwargs and isinstance(kwargs['transcription_engine'], TranscriptionEngine):
             models = kwargs['transcription_engine']
@@ -549,6 +550,8 @@ class AudioProcessor:
                 if should_push:
                     self.metrics.n_responses_sent += 1
                     yield response
+                    if self.transcript_writer:
+                        self.transcript_writer.update(response)
                     self.last_response_content = response
 
                 if self.is_stopping and self._processing_tasks_done():
@@ -650,6 +653,10 @@ class AudioProcessor:
                 logger.warning(f"Error stopping FFmpeg manager: {e}")
         if self.diarization:
             self.diarization.close()
+
+        if self.transcript_writer:
+            duration = self.total_pcm_samples / self.sample_rate
+            self.transcript_writer.finalize(duration)
 
         # Finalize session metrics
         self.metrics.total_audio_duration_s = self.total_pcm_samples / self.sample_rate

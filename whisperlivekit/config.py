@@ -34,6 +34,10 @@ class WhisperLiveKitConfig:
     backend_policy: str = "simulstreaming"
     backend: str = "auto"
 
+    # Transcript saving
+    save_transcript: bool = False
+    transcript_dir: str = "./transcripts"
+
     # Transcription common
     warmup_file: Optional[str] = None
     min_chunk_size: float = 0.1

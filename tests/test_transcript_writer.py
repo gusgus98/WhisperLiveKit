@@ -166,3 +166,24 @@ class TestTranscriptWriterSessionId:
 
         assert new_dir.exists()
         assert (new_dir / "test.partial.json").exists()
+
+
+class TestConfigFields:
+    """Tests for save_transcript config fields."""
+
+    def test_config_defaults(self):
+        from whisperlivekit.config import WhisperLiveKitConfig
+
+        config = WhisperLiveKitConfig()
+        assert config.save_transcript is False
+        assert config.transcript_dir == "./transcripts"
+
+    def test_config_from_kwargs(self):
+        from whisperlivekit.config import WhisperLiveKitConfig
+
+        config = WhisperLiveKitConfig.from_kwargs(
+            save_transcript=True,
+            transcript_dir="/tmp/out",
+        )
+        assert config.save_transcript is True
+        assert config.transcript_dir == "/tmp/out"

@@ -333,6 +333,22 @@ def parse_args():
         help="600M or 1.3B",
     )
 
+    # Transcript saving
+    parser.add_argument(
+        "--save-transcript",
+        action="store_true",
+        default=False,
+        dest="save_transcript",
+        help="Save transcripts to JSON files in the transcript directory.",
+    )
+    parser.add_argument(
+        "--transcript-dir",
+        type=str,
+        default="./transcripts",
+        dest="transcript_dir",
+        help="Directory to save transcript files (default: ./transcripts).",
+    )
+
     args = parser.parse_args()
     args.transcription = not args.no_transcription
     args.vad = not args.no_vad
