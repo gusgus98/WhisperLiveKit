@@ -13,7 +13,10 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(/home/gusobenitez/miniconda3/envs/whisper-env/bin/python -m pytest tests/test_transcript_writer.py -v)",
-      "Bash(conda run *)"
+      "Bash(conda run *)",
+      "Bash(/mnt/c/Users/Owner/Documents/GitHub/WhisperLiveKit/.venv/bin/python -m pytest tests/test_transcript_writer.py -v)",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(uv pip *)"
     ]
   }
 }

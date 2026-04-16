@@ -41,6 +41,7 @@ class TokensAlignment:
         self.unvalidated_tokens: PuncSegment = []
 
         self._retention_seconds: float = _DEFAULT_RETENTION_SECONDS
+        self._save_transcript: bool = False
 
     def update(self) -> None:
         """Drain state buffers into the running alignment context."""
@@ -55,7 +56,14 @@ class TokensAlignment:
         self.new_translation_buffer = self.state.new_translation_buffer
 
     def _prune(self) -> None:
-        """Drop tokens/segments older than ``_retention_seconds`` from the latest token."""
+        """Drop tokens/segments older than ``_retention_seconds`` from the latest token.
+
+        Skipped when ``_save_transcript`` is True so that the full session
+        history is preserved for transcript saving.  The display is filtered
+        to the retention window in ``results_formatter`` instead.
+        """
+        if self._save_transcript:
+            return
         if not self.all_tokens:
             return
 

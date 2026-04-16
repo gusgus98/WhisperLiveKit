@@ -88,6 +88,8 @@ class AudioProcessor:
         self.last_response_content: FrontData = FrontData()
 
         self.tokens_alignment: TokensAlignment = TokensAlignment(self.state, self.args, self.sep)
+        if self.transcript_writer:
+            self.tokens_alignment._save_transcript = True
         self.beg_loop: Optional[float] = None
 
         # Models and processing
@@ -522,7 +524,7 @@ class AudioProcessor:
                     continue
 
                 self.tokens_alignment.update()
-                lines, buffer_diarization_text, buffer_translation_text = self.tokens_alignment.get_lines(
+                all_lines, buffer_diarization_text, buffer_translation_text = self.tokens_alignment.get_lines(
                     diarization=self.args.diarization,
                     translation=bool(self.translation),
                     current_silence=self.current_silence,
@@ -532,13 +534,27 @@ class AudioProcessor:
 
                 buffer_transcription_text = state.buffer_transcription.text if state.buffer_transcription else ''
 
+                # When transcript saving disables pruning, filter display
+                # lines to the retention window so the WebSocket doesn't
+                # send the full session history on every update.
+                if self.transcript_writer and all_lines:
+                    retention = self.tokens_alignment._retention_seconds
+                    latest_end = max(
+                        (l.end for l in all_lines if hasattr(l, 'end') and l.end is not None),
+                        default=0,
+                    )
+                    cutoff = latest_end - retention
+                    display_lines = [l for l in all_lines if l.end is None or l.end >= cutoff]
+                else:
+                    display_lines = all_lines
+
                 response_status = "active_transcription"
-                if not lines and not buffer_transcription_text and not buffer_diarization_text:
+                if not display_lines and not buffer_transcription_text and not buffer_diarization_text:
                     response_status = "no_audio_detected"
 
                 response = FrontData(
                     status=response_status,
-                    lines=lines,
+                    lines=display_lines,
                     buffer_transcription=buffer_transcription_text,
                     buffer_diarization=buffer_diarization_text,
                     buffer_translation=buffer_translation_text,
@@ -546,12 +562,23 @@ class AudioProcessor:
                     remaining_time_diarization=state.remaining_time_diarization if self.args.diarization else 0
                 )
 
+                # Update transcript writer with FULL lines (before display filtering)
+                if self.transcript_writer:
+                    transcript_response = FrontData(
+                        status=response_status,
+                        lines=all_lines,
+                        buffer_transcription=buffer_transcription_text,
+                        buffer_diarization=buffer_diarization_text,
+                        buffer_translation=buffer_translation_text,
+                        remaining_time_transcription=state.remaining_time_transcription,
+                        remaining_time_diarization=state.remaining_time_diarization if self.args.diarization else 0
+                    )
+                    self.transcript_writer.update(transcript_response)
+
                 should_push = (response != self.last_response_content)
                 if should_push:
                     self.metrics.n_responses_sent += 1
                     yield response
-                    if self.transcript_writer:
-                        self.transcript_writer.update(response)
                     self.last_response_content = response
 
                 if self.is_stopping and self._processing_tasks_done():
@@ -633,7 +660,13 @@ class AudioProcessor:
                 logger.error(f"Error in watchdog task: {e}", exc_info=True)
 
     async def cleanup(self) -> None:
-        """Clean up resources when processing is complete."""
+        """Clean up resources when processing is complete.
+
+        Idempotent -- safe to call more than once.
+        """
+        if getattr(self, '_cleaned_up', False):
+            return
+        self._cleaned_up = True
         logger.info("Starting cleanup of AudioProcessor resources.")
         self.is_stopping = True
         for task in self.all_tasks_for_cleanup:
@@ -654,7 +687,7 @@ class AudioProcessor:
         if self.diarization:
             self.diarization.close()
 
-        if self.transcript_writer and self.total_pcm_samples > 0:
+        if self.transcript_writer:
             try:
                 duration = self.total_pcm_samples / self.sample_rate
                 self.transcript_writer.finalize(duration)

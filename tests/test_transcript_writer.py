@@ -83,6 +83,47 @@ class TestTranscriptWriterUpdate:
         assert data["segments"][0]["text"] == "Hello"
         assert data["segments"][1]["text"] == "World"
 
+    def test_update_preserves_window_segments_through_silence_only_update(self, tmp_path):
+        """Segments must not be lost when a silence-only update empties current_segments.
+
+        Scenario: speech → long break (silence marker only) → speech resumes.
+        All three speech segments must appear in the final transcript.
+        """
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        writer = TranscriptWriter(output_dir=str(tmp_path), session_id="test-session")
+
+        # Step 1: initial speech
+        fd1 = _make_front_data([
+            {"start": 0.0, "end": 2.0, "text": "Hello everyone", "speaker": 1},
+            {"start": 2.0, "end": 4.0, "text": "Welcome to the meeting", "speaker": 1},
+        ])
+        writer.update(fd1)
+        writer._last_write_time = 0.0
+
+        # Step 2: silence-only live view (long break) — _extract_segments returns []
+        fd2 = _make_front_data([
+            {"start": 4.0, "end": 50.0, "text": None, "speaker": -2},
+        ])
+        writer.update(fd2)
+        writer._last_write_time = 0.0
+
+        # Step 3: speech resumes after the break
+        fd3 = _make_front_data([
+            {"start": 50.0, "end": 52.0, "text": "Back from break", "speaker": 1},
+        ])
+        writer.update(fd3)
+
+        writer.finalize(total_duration=60.0)
+
+        import json
+        data = json.loads((tmp_path / "test-session.json").read_text())
+        texts = [s["text"] for s in data["segments"]]
+        assert "Hello everyone" in texts, f"Expected 'Hello everyone' in {texts}"
+        assert "Welcome to the meeting" in texts, f"Expected 'Welcome to the meeting' in {texts}"
+        assert "Back from break" in texts, f"Expected 'Back from break' in {texts}"
+        assert len(data["segments"]) == 3
+
     def test_update_throttles_writes(self, tmp_path):
         from whisperlivekit.transcript_writer import TranscriptWriter
 
@@ -174,6 +215,96 @@ class TestTranscriptWriterSessionId:
 
         assert new_dir.exists()
         assert (new_dir / "test.partial.json").exists()
+
+
+class TestSlidingWindowArchival:
+    """Tests for the sliding window accumulation that survives _prune()."""
+
+    def test_segments_archived_when_window_slides(self, tmp_path):
+        """Segments that fall out of the live window must appear in the final transcript."""
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        writer = TranscriptWriter(output_dir=str(tmp_path), session_id="test-session")
+
+        # Window 1: segments at 0-5s and 5-10s
+        fd1 = _make_front_data([
+            {"start": 0.0, "end": 5.0, "text": "First segment"},
+            {"start": 5.0, "end": 10.0, "text": "Second segment"},
+        ])
+        writer.update(fd1)
+        writer._last_write_time = 0.0
+
+        # Window 2: window slides forward, only 10-15s visible
+        fd2 = _make_front_data([
+            {"start": 10.0, "end": 15.0, "text": "Third segment"},
+        ])
+        writer.update(fd2)
+
+        writer.finalize(total_duration=15.0)
+
+        data = json.loads((tmp_path / "test-session.json").read_text())
+        texts = [s["text"] for s in data["segments"]]
+        assert texts == ["First segment", "Second segment", "Third segment"]
+
+    def test_abutting_boundary_segments_not_dropped(self, tmp_path):
+        """Segments where B.end == C.start must be archived, not silently lost."""
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        writer = TranscriptWriter(output_dir=str(tmp_path), session_id="test-session")
+
+        # Three abutting segments: Alpha(0-5), Beta(5-10), Gamma(10-15)
+        fd1 = _make_front_data([
+            {"start": 0.0, "end": 5.0, "text": "Alpha"},
+            {"start": 5.0, "end": 10.0, "text": "Beta"},
+            {"start": 10.0, "end": 15.0, "text": "Gamma"},
+        ])
+        writer.update(fd1)
+        writer._last_write_time = 0.0
+
+        # Window slides: only Gamma visible (start=10, matching Beta's end)
+        fd2 = _make_front_data([
+            {"start": 10.0, "end": 15.0, "text": "Gamma"},
+        ])
+        writer.update(fd2)
+        writer._last_write_time = 0.0
+
+        # Window slides again: only Delta visible (start=15, matching Gamma's end)
+        fd3 = _make_front_data([
+            {"start": 15.0, "end": 20.0, "text": "Delta"},
+        ])
+        writer.update(fd3)
+
+        writer.finalize(total_duration=20.0)
+
+        data = json.loads((tmp_path / "test-session.json").read_text())
+        texts = [s["text"] for s in data["segments"]]
+        assert texts == ["Alpha", "Beta", "Gamma", "Delta"], f"Got: {texts}"
+
+    def test_no_double_archiving(self, tmp_path):
+        """A segment in the current window must not also appear in the archive."""
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        writer = TranscriptWriter(output_dir=str(tmp_path), session_id="test-session")
+
+        fd1 = _make_front_data([
+            {"start": 0.0, "end": 5.0, "text": "First"},
+            {"start": 5.0, "end": 10.0, "text": "Second"},
+        ])
+        writer.update(fd1)
+        writer._last_write_time = 0.0
+
+        # Window slides partially: Second is still visible
+        fd2 = _make_front_data([
+            {"start": 5.0, "end": 10.0, "text": "Second"},
+            {"start": 10.0, "end": 15.0, "text": "Third"},
+        ])
+        writer.update(fd2)
+
+        writer.finalize(total_duration=15.0)
+
+        data = json.loads((tmp_path / "test-session.json").read_text())
+        texts = [s["text"] for s in data["segments"]]
+        assert texts == ["First", "Second", "Third"], f"Got: {texts}"
 
 
 class TestConfigFields:

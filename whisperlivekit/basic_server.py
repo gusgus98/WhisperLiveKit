@@ -80,7 +80,7 @@ async def health():
     })
 
 
-async def handle_websocket_results(websocket, results_generator, diff_tracker=None, session_id=None):
+async def handle_websocket_results(websocket, results_generator, diff_tracker=None, session_id=None, audio_processor=None):
     """Consumes results from the audio processor and sends them via WebSocket."""
     try:
         async for response in results_generator:
@@ -88,7 +88,11 @@ async def handle_websocket_results(websocket, results_generator, diff_tracker=No
                 await websocket.send_json(diff_tracker.to_message(response))
             else:
                 await websocket.send_json(response.to_dict())
-        # when the results_generator finishes it means all audio has been processed
+        # Finalize transcript before telling client the file is ready,
+        # otherwise the client may request the download before the final
+        # JSON is written to disk.
+        if audio_processor:
+            await audio_processor.cleanup()
         logger.info("Results generator finished. Sending 'ready_to_stop' to client.")
         stop_msg = {"type": "ready_to_stop"}
         if session_id:
@@ -139,7 +143,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.warning(f"Failed to send config to client: {e}")
 
     results_generator = await audio_processor.create_tasks()
-    websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator, diff_tracker, session_id=session_id))
+    websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator, diff_tracker, session_id=session_id, audio_processor=audio_processor))
 
     try:
         while True:
