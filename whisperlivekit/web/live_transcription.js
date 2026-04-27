@@ -640,6 +640,9 @@ async function startRecording() {
       systemAudioStream = systemStream;
       systemAudioSource = audioContext.createMediaStreamSource(systemStream);
       systemAudioSource.connect(mixerGain);
+      // Halve gain so two unity-gain sources don't sum past ±1 and clip,
+      // which produces distorted audio that triggers Whisper hallucination loops.
+      mixerGain.gain.value = 0.5;
       if (systemAudioBadge) systemAudioBadge.classList.add("active");
       // Graceful degradation if user stops sharing
       systemStream.getAudioTracks().forEach(track => {
@@ -650,6 +653,7 @@ async function startRecording() {
             systemAudioSource = null;
           }
           systemAudioStream = null;
+          if (mixerGain) mixerGain.gain.value = 1.0;
           if (systemAudioBadge) systemAudioBadge.classList.remove("active");
           statusText.textContent = "System audio stopped. Continuing with microphone.";
         });

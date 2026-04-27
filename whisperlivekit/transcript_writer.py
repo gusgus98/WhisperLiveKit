@@ -82,20 +82,35 @@ class TranscriptWriter:
         """
         current_segments = self._extract_segments(front_data)
 
-        # Archive segments from the previous window that fell out of the
-        # current live view (their end time is before the current window start).
+        # Archive previous-window segments that have truly dropped out of the
+        # live view. Two conditions must both hold:
+        #   1. The segment's start time is no longer present in the current
+        #      window. (Without this, a degenerate segment with end <= start
+        #      -- e.g. a Whisper hallucination loop with mis-aligned word
+        #      timestamps -- self-archives every tick and produces thousands
+        #      of duplicates.)
+        #   2. The segment's end time is at or before the new window start.
+        #      (Without this, when get_lines_diarization() merges two
+        #      previously separate punctuation segments into one once speaker
+        #      labels arrive, the merged-away fragment would be archived even
+        #      though its text is now part of the merged segment, duplicating
+        #      that text on finalize.)
         # When current_segments is empty (e.g. silence-only live view after a
-        # meeting break), all previous window segments must be archived
-        # unconditionally — otherwise they are silently lost at line 98.
+        # meeting break), all previous window segments must be archived.
         if self._window_segments and not current_segments:
             for seg in self._window_segments:
                 self._archived_segments.append(self._clean(seg))
         elif self._window_segments and current_segments:
+            current_starts = {seg.get("_start_s") for seg in current_segments}
             window_start = current_segments[0].get("_start_s")
             if window_start is not None:
                 for seg in self._window_segments:
                     end_s = seg.get("_end_s")
-                    if end_s is not None and end_s <= window_start:
+                    if (
+                        seg.get("_start_s") not in current_starts
+                        and end_s is not None
+                        and end_s <= window_start
+                    ):
                         self._archived_segments.append(self._clean(seg))
 
         self._window_segments = current_segments

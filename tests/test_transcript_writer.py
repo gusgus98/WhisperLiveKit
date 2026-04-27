@@ -306,6 +306,92 @@ class TestSlidingWindowArchival:
         texts = [s["text"] for s in data["segments"]]
         assert texts == ["First", "Second", "Third"], f"Got: {texts}"
 
+    def test_inverted_timestamps_do_not_self_archive(self, tmp_path):
+        """A segment with end < start (Whisper hallucination loop) must not
+        be re-archived on every update.
+
+        Regression for the bug that produced ~3,000 duplicates of the same
+        inverted-timestamp segment in a real session JSON file.
+        """
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        writer = TranscriptWriter(output_dir=str(tmp_path), session_id="test-session")
+
+        # Inverted timestamps from a Whisper hallucination loop: end < start.
+        bad_seg = {"start": 3.48, "end": 1.14, "text": " new new new new", "speaker": 1}
+        fd = _make_front_data([bad_seg])
+
+        # results_formatter polls every ~50ms with no new tokens; pruning is
+        # disabled when transcript saving is on, so the same segment stays as
+        # the only line for many iterations.
+        for _ in range(200):
+            writer.update(fd)
+
+        writer.finalize(total_duration=10.0)
+        data = json.loads((tmp_path / "test-session.json").read_text())
+        assert len(data["segments"]) == 1, (
+            f"Expected 1 segment, got {len(data['segments'])} duplicates"
+        )
+
+    def test_diarization_merge_does_not_duplicate_text(self, tmp_path):
+        """When upstream merges two segments into one (e.g. diarization labels
+        both as the same speaker in get_lines_diarization()), the merged-away
+        fragment must not be archived as a dropped segment.
+
+        Without this guard, the second old segment's start disappears from the
+        new window's start set, so the start-membership check alone would
+        archive it -- and on finalize its text would appear both in the
+        archive and in the merged current segment.
+        """
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        writer = TranscriptWriter(output_dir=str(tmp_path), session_id="test-session")
+
+        # Tick 1: two separate punctuation segments (speakers tentative)
+        fd1 = _make_front_data([
+            {"start": 5.0, "end": 8.0, "text": "Hello,", "speaker": 1},
+            {"start": 8.0, "end": 10.0, "text": " world.", "speaker": 2},
+        ])
+        writer.update(fd1)
+        writer._last_write_time = 0.0
+
+        # Tick 2: diarization merges them upstream -> one segment, same span
+        fd2 = _make_front_data([
+            {"start": 5.0, "end": 10.0, "text": "Hello, world.", "speaker": 1},
+        ])
+        writer.update(fd2)
+
+        writer.finalize(total_duration=15.0)
+        data = json.loads((tmp_path / "test-session.json").read_text())
+        texts = [s["text"] for s in data["segments"]]
+        # The merged text must appear exactly once -- no orphaned fragment.
+        assert texts == ["Hello, world."], f"Got {texts}"
+
+    def test_repeated_update_does_not_duplicate_unchanged_segments(self, tmp_path):
+        """Many update() calls with identical lines must produce one copy each.
+
+        The results_formatter loop polls every ~50ms; segments that haven't
+        changed must not accumulate.
+        """
+        from whisperlivekit.transcript_writer import TranscriptWriter
+
+        writer = TranscriptWriter(output_dir=str(tmp_path), session_id="test-session")
+
+        fd = _make_front_data([
+            {"start": 0.0, "end": 5.0, "text": "First"},
+            {"start": 5.0, "end": 10.0, "text": "Second"},
+        ])
+
+        for _ in range(50):
+            writer.update(fd)
+
+        writer.finalize(total_duration=10.0)
+        data = json.loads((tmp_path / "test-session.json").read_text())
+        texts = [s["text"] for s in data["segments"]]
+        assert texts == ["First", "Second"], (
+            f"Got {len(data['segments'])} segments: {texts}"
+        )
+
 
 class TestConfigFields:
     """Tests for save_transcript config fields."""
