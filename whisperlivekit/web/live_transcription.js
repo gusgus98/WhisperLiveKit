@@ -287,7 +287,18 @@ function buildTranscriptText() {
 }
 
 function downloadTranscript() {
-  const text = buildTranscriptText();
+  let text = buildTranscriptText();
+  let usedFallback = false;
+  // Defensive fallback: if the session map happens to be empty (stale tab,
+  // page refresh mid-session, etc.) but the DOM has rendered transcript
+  // content, dump the visible text so the button still produces a file.
+  if (!text && linesTranscriptDiv) {
+    const dom = (linesTranscriptDiv.innerText || "").trim();
+    if (dom && !dom.toLowerCase().startsWith("no audio detected")) {
+      text = dom;
+      usedFallback = true;
+    }
+  }
   if (!text) {
     statusText.textContent = "Nothing to download yet.";
     return;
@@ -302,6 +313,9 @@ function downloadTranscript() {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+  statusText.textContent = usedFallback
+    ? "Transcript downloaded (from rendered text)."
+    : "Transcript downloaded.";
 }
 
 function detachSystemAudio() {
