@@ -281,6 +281,44 @@ body {
   gap: 3px;
 }
 
+.checkbox-field {
+  align-self: flex-end;
+  padding-bottom: 4px;
+}
+
+.checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #007bff;
+  cursor: pointer;
+}
+
+.checkbox-row input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+}
+
+.checkbox-row:has(input:disabled) {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.field-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 20px;
+}
+
 #chunkSelector,
 #websocketInput,
 #themeSelector,

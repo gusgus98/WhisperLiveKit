@@ -31,6 +31,10 @@ let configReadyResolve;
 const configReady = new Promise((r) => (configReadyResolve = r));
 let outputAudioContext = null;
 let audioSource = null;
+let systemAudioEnabled = false;
+let systemAudioStream = null;
+let systemAudioSourceNode = null;
+let systemTrackEndedHandler = null;
 
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
@@ -45,6 +49,8 @@ const linesTranscriptDiv = document.getElementById("linesTranscript");
 const timerElement = document.querySelector(".timer");
 const themeRadios = document.querySelectorAll('input[name="theme"]');
 const microphoneSelect = document.getElementById("microphoneSelect");
+const systemAudioToggle = document.getElementById("systemAudioToggle");
+const systemAudioHint = document.getElementById("systemAudioHint");
 
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsDiv = document.querySelector(".settings");
@@ -175,6 +181,58 @@ function handleMicrophoneChange() {
 function fmt1(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n.toFixed(1) : x;
+}
+
+function isSystemAudioSupported() {
+  if (!isWebContext) return false;
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== "function") return false;
+  // Firefox and Safari implement getDisplayMedia but silently ignore the audio request.
+  const ua = navigator.userAgent || "";
+  const isFirefox = /Firefox\//i.test(ua);
+  const isSafari = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(ua);
+  return !isFirefox && !isSafari;
+}
+
+async function getSystemAudioStream() {
+  let displayStream;
+  try {
+    displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+    });
+  } catch (err) {
+    const e = new Error("System audio sharing cancelled or denied.");
+    e.code = "USER_CANCELLED";
+    throw e;
+  }
+  displayStream.getVideoTracks().forEach((t) => {
+    try { t.stop(); } catch (_) {}
+  });
+  const audioTracks = displayStream.getAudioTracks();
+  if (audioTracks.length === 0) {
+    const e = new Error('No audio in shared source. Re-share and tick "Share audio".');
+    e.code = "NO_AUDIO_TRACK";
+    throw e;
+  }
+  return new MediaStream(audioTracks);
+}
+
+function detachSystemAudio() {
+  if (systemAudioSourceNode) {
+    try { systemAudioSourceNode.disconnect(); } catch (_) {}
+    systemAudioSourceNode = null;
+  }
+  if (systemAudioStream) {
+    const sysTrack = systemAudioStream.getAudioTracks()[0];
+    if (sysTrack && systemTrackEndedHandler) {
+      try { sysTrack.removeEventListener("ended", systemTrackEndedHandler); } catch (_) {}
+    }
+    systemAudioStream.getTracks().forEach((t) => {
+      try { t.stop(); } catch (_) {}
+    });
+    systemAudioStream = null;
+  }
+  systemTrackEndedHandler = null;
 }
 
 let host, port, protocol;
@@ -558,10 +616,32 @@ async function startRecording() {
         statusText.textContent = "Using microphone audio.";
       }
     } else if (isWebContext) {
-      const audioConstraints = selectedMicrophoneId 
+      const audioConstraints = selectedMicrophoneId
         ? { audio: { deviceId: { exact: selectedMicrophoneId } } }
         : { audio: true };
       stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+    }
+
+    if (systemAudioEnabled && isWebContext) {
+      try {
+        systemAudioStream = await getSystemAudioStream();
+        const sysTrack = systemAudioStream.getAudioTracks()[0];
+        systemTrackEndedHandler = () => {
+          statusText.textContent = "System audio sharing ended; continuing with microphone.";
+          detachSystemAudio();
+        };
+        sysTrack.addEventListener("ended", systemTrackEndedHandler);
+        statusText.textContent = "Capturing microphone + system audio.";
+      } catch (sysErr) {
+        statusText.textContent = sysErr.message || "Could not capture system audio.";
+        stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
+        if (wakeLock) {
+          try { await wakeLock.release(); } catch (_) {}
+          wakeLock = null;
+        }
+        console.warn("System audio capture failed:", sysErr);
+        return;
+      }
     }
 
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -577,6 +657,11 @@ async function startRecording() {
       await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");
       workletNode = new AudioWorkletNode(audioContext, "pcm-forwarder", { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
       microphone.connect(workletNode);
+
+      if (systemAudioStream) {
+        systemAudioSourceNode = audioContext.createMediaStreamSource(systemAudioStream);
+        systemAudioSourceNode.connect(workletNode);
+      }
 
       recorderWorker = new Worker("/web/recorder_worker.js");
       recorderWorker.postMessage({
@@ -604,10 +689,18 @@ async function startRecording() {
         );
       };
     } else {
+      let recorderStream = stream;
+      if (systemAudioStream) {
+        const dest = audioContext.createMediaStreamDestination();
+        microphone.connect(dest);
+        systemAudioSourceNode = audioContext.createMediaStreamSource(systemAudioStream);
+        systemAudioSourceNode.connect(dest);
+        recorderStream = dest.stream;
+      }
       try {
-        recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+        recorder = new MediaRecorder(recorderStream, { mimeType: "audio/webm" });
       } catch (e) {
-        recorder = new MediaRecorder(stream);
+        recorder = new MediaRecorder(recorderStream);
       }
       recorder.ondataavailable = (e) => {
         if (websocket && websocket.readyState === WebSocket.OPEN) {
@@ -626,6 +719,7 @@ async function startRecording() {
     isRecording = true;
     updateUI();
   } catch (err) {
+    detachSystemAudio();
     if (window.location.hostname === "0.0.0.0") {
       statusText.textContent =
         "Error accessing microphone. Browsers may block microphone access on 0.0.0.0. Try using localhost:8000 instead.";
@@ -686,6 +780,8 @@ async function stopRecording() {
   if (analyser) {
     analyser = null;
   }
+
+  detachSystemAudio();
 
   if (audioContext && audioContext.state !== "closed") {
     try {
@@ -775,6 +871,26 @@ recordButton.addEventListener("click", toggleRecording);
 
 if (microphoneSelect) {
   microphoneSelect.addEventListener("change", handleMicrophoneChange);
+}
+
+if (systemAudioToggle) {
+  if (!isSystemAudioSupported()) {
+    systemAudioToggle.disabled = true;
+    systemAudioToggle.checked = false;
+    systemAudioEnabled = false;
+    systemAudioToggle.title = "Capturing system audio requires Chrome or Edge on desktop.";
+    if (systemAudioHint) {
+      systemAudioHint.textContent = "Not supported in this browser";
+    }
+  } else {
+    const saved = localStorage.getItem("systemAudioEnabled") === "1";
+    systemAudioToggle.checked = saved;
+    systemAudioEnabled = saved;
+    systemAudioToggle.addEventListener("change", () => {
+      systemAudioEnabled = !!systemAudioToggle.checked;
+      localStorage.setItem("systemAudioEnabled", systemAudioEnabled ? "1" : "0");
+    });
+  }
 }
 document.addEventListener('DOMContentLoaded', async () => {
   try {
