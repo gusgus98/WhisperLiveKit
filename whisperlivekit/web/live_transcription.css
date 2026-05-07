@@ -241,6 +241,18 @@ body {
   height: 20px;
 }
 
+#downloadButton {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1;
+}
+
+#downloadButton:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 @media (max-width: 10000px) {
   .settings-toggle {
     display: flex;

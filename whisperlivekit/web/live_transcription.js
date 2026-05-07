@@ -35,6 +35,11 @@ let systemAudioEnabled = false;
 let systemAudioStream = null;
 let systemAudioSourceNode = null;
 let systemTrackEndedHandler = null;
+// Server prunes lines older than ~5 min from each response to bound memory.
+// Frontend keeps the full session locally so the rendered transcript and any
+// download contain the entire meeting. Keyed by start time (number) for
+// in-place updates when a line's text grows or its speaker is reassigned.
+const sessionLines = new Map();
 
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
@@ -54,6 +59,7 @@ const systemAudioHint = document.getElementById("systemAudioHint");
 
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsDiv = document.querySelector(".settings");
+const downloadButton = document.getElementById("downloadButton");
 
 // if (isExtension) {
 //   chrome.runtime.onInstalled.addListener((details) => {
@@ -217,6 +223,70 @@ async function getSystemAudioStream() {
   return new MediaStream(audioTracks);
 }
 
+function mergeSessionLines(incoming) {
+  if (!incoming || !incoming.length) return;
+  for (const line of incoming) {
+    if (line == null) continue;
+    const key = typeof line.start === "number" ? line.start : `_${line.text || ""}`;
+    sessionLines.set(key, line);
+  }
+}
+
+function getSessionLinesArray() {
+  return Array.from(sessionLines.values()).sort((a, b) => {
+    const sa = typeof a.start === "number" ? a.start : 0;
+    const sb = typeof b.start === "number" ? b.start : 0;
+    return sa - sb;
+  });
+}
+
+function resetSessionLines() {
+  sessionLines.clear();
+  lastSignature = null;
+}
+
+function formatTimestamp(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "00:00";
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+function buildTranscriptText() {
+  const lines = getSessionLinesArray();
+  const out = [];
+  for (const line of lines) {
+    if (line.speaker === -2) continue; // skip silence segments
+    const text = (line.text || "").trim();
+    if (!text) continue;
+    const ts = typeof line.start === "number" ? `[${formatTimestamp(line.start)}] ` : "";
+    const speaker = line.speaker && line.speaker > 0 ? `Speaker ${line.speaker}: ` : "";
+    out.push(`${ts}${speaker}${text}`);
+  }
+  return out.join("\n");
+}
+
+function downloadTranscript() {
+  const text = buildTranscriptText();
+  if (!text) {
+    statusText.textContent = "Nothing to download yet.";
+    return;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `transcript_${stamp}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function detachSystemAudio() {
   if (systemAudioSourceNode) {
     try { systemAudioSourceNode.disconnect(); } catch (_) {}
@@ -343,8 +413,9 @@ function setupWebSocket() {
         waitingForStop = false;
 
         if (lastReceivedData) {
+          mergeSessionLines(lastReceivedData.lines || []);
           renderLinesWithBuffer(
-            lastReceivedData.lines || [],
+            getSessionLinesArray(),
             lastReceivedData.buffer_diarization || "",
             lastReceivedData.buffer_transcription || "",
             lastReceivedData.buffer_translation || "",
@@ -374,8 +445,10 @@ function setupWebSocket() {
         status = "active_transcription",
       } = data;
 
+      mergeSessionLines(lines);
+
       renderLinesWithBuffer(
-        lines,
+        getSessionLinesArray(),
         buffer_diarization,
         buffer_transcription,
         buffer_translation,
@@ -398,7 +471,11 @@ function renderLinesWithBuffer(
   isFinalizing = false,
   current_status = "active_transcription"
 ) {
-  if (current_status === "no_audio_detected") {
+  // Don't wipe the transcript when the server reports no_audio_detected if we
+  // already have content — the server prunes lines >5 min old, and during
+  // silence the response can briefly contain no lines even mid-meeting.
+  const hasContent = (lines && lines.length > 0) || (buffer_transcription && buffer_transcription.length > 0);
+  if (current_status === "no_audio_detected" && !hasContent) {
     linesTranscriptDiv.innerHTML =
       "<p style='text-align: center; color: var(--muted); margin-top: 20px;'><em>No audio detected...</em></p>";
     return;
@@ -577,6 +654,8 @@ function drawWaveform() {
 
 async function startRecording() {
   try {
+    resetSessionLines();
+    linesTranscriptDiv.innerHTML = "";
     try {
       wakeLock = await navigator.wakeLock.request("screen");
     } catch (err) {
@@ -913,6 +992,10 @@ settingsToggle.addEventListener("click", () => {
 settingsDiv.classList.toggle("visible");
 settingsToggle.classList.toggle("active");
 });
+
+if (downloadButton) {
+  downloadButton.addEventListener("click", downloadTranscript);
+}
 
 if (isExtension) {
   async function checkAndRequestPermissions() {
