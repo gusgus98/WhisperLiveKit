@@ -223,21 +223,37 @@ async function getSystemAudioStream() {
   return new MediaStream(audioTracks);
 }
 
+// Server emits start/end as formatted strings ("H:MM:SS.cc") via Segment.to_dict
+// in timed_objects.py. Parse back to seconds for keying, sorting, and timestamp
+// formatting. Tolerant of numeric input for safety in tests / future callers.
+function parseStartSeconds(line) {
+  if (!line) return 0;
+  const s = line.start;
+  if (typeof s === "number" && Number.isFinite(s)) return s;
+  if (typeof s !== "string") return 0;
+  const parts = s.split(":");
+  if (parts.length < 2) return Number(s) || 0;
+  const sec = parseFloat(parts[parts.length - 1]) || 0;
+  const min = parseInt(parts[parts.length - 2], 10) || 0;
+  const hrs = parts.length >= 3 ? parseInt(parts[parts.length - 3], 10) || 0 : 0;
+  return hrs * 3600 + min * 60 + sec;
+}
+
 function mergeSessionLines(incoming) {
   if (!incoming || !incoming.length) return;
   for (const line of incoming) {
     if (line == null) continue;
-    const key = typeof line.start === "number" ? line.start : `_${line.text || ""}`;
+    // Key by (speaker, start_seconds) so progressive partials overwrite the
+    // previous partial for the same segment instead of accumulating duplicates.
+    const key = `${line.speaker ?? "?"}_${parseStartSeconds(line)}`;
     sessionLines.set(key, line);
   }
 }
 
 function getSessionLinesArray() {
-  return Array.from(sessionLines.values()).sort((a, b) => {
-    const sa = typeof a.start === "number" ? a.start : 0;
-    const sb = typeof b.start === "number" ? b.start : 0;
-    return sa - sb;
-  });
+  return Array.from(sessionLines.values()).sort(
+    (a, b) => parseStartSeconds(a) - parseStartSeconds(b),
+  );
 }
 
 function resetSessionLines() {
@@ -262,7 +278,8 @@ function buildTranscriptText() {
     if (line.speaker === -2) continue; // skip silence segments
     const text = (line.text || "").trim();
     if (!text) continue;
-    const ts = typeof line.start === "number" ? `[${formatTimestamp(line.start)}] ` : "";
+    const startSec = parseStartSeconds(line);
+    const ts = Number.isFinite(startSec) ? `[${formatTimestamp(startSec)}] ` : "";
     const speaker = line.speaker && line.speaker > 0 ? `Speaker ${line.speaker}: ` : "";
     out.push(`${ts}${speaker}${text}`);
   }
