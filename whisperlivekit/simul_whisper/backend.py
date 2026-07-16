@@ -1,3 +1,4 @@
+import dataclasses
 import gc
 import logging
 import platform
@@ -37,11 +38,17 @@ class SimulStreamingOnlineProcessor:
     """Online processor for SimulStreaming ASR."""
     SAMPLING_RATE = 16000
 
-    def __init__(self, asr, logfile=sys.stderr):
+    def __init__(self, asr, logfile=sys.stderr, language=None):
         self.asr = asr
         self.logfile = logfile
         self.end = 0.0
         self.buffer = []
+        # Per-session language override: copy the shared config so other
+        # sessions keep the server-wide language.
+        if language is not None and language != asr.cfg.language:
+            self.cfg = dataclasses.replace(asr.cfg, language=language)
+        else:
+            self.cfg = asr.cfg
         self.model = self._create_alignatt()
 
         if asr.tokenizer:
@@ -51,10 +58,10 @@ class SimulStreamingOnlineProcessor:
     def _create_alignatt(self):
         """Create the AlignAtt decoder instance based on ASR mode."""
         if self.asr.use_full_mlx and HAS_MLX_WHISPER:
-            return MLXAlignAtt(cfg=self.asr.cfg, mlx_model=self.asr.mlx_model)
+            return MLXAlignAtt(cfg=self.cfg, mlx_model=self.asr.mlx_model)
         else:
             return AlignAtt(
-                cfg=self.asr.cfg,
+                cfg=self.cfg,
                 loaded_model=self.asr.shared_model,
                 mlx_encoder=self.asr.mlx_encoder,
                 fw_encoder=self.asr.fw_encoder,

@@ -59,8 +59,9 @@ class AudioProcessor:
 
     def __init__(self, **kwargs: Any) -> None:
         """Initialize the audio processor with configuration, models, and state."""
-        # Extract per-session language override before passing to TranscriptionEngine
+        # Extract per-session overrides before passing to TranscriptionEngine
         session_language = kwargs.pop('language', None)
+        session_diarization = kwargs.pop('diarization', None)
 
         if 'transcription_engine' in kwargs and isinstance(kwargs['transcription_engine'], TranscriptionEngine):
             models = kwargs['transcription_engine']
@@ -69,6 +70,10 @@ class AudioProcessor:
 
         # Audio processing settings
         self.args = models.args
+        # Per-session diarization toggle; falls back to the server-wide flag
+        self.diarization_enabled: bool = (
+            self.args.diarization if session_diarization is None else session_diarization
+        )
         self.sample_rate = 16000
         self.channels = 1
         chunk_seconds = self.args.vac_chunk_size if self.args.vac else self.args.min_chunk_size
@@ -114,7 +119,7 @@ class AudioProcessor:
             self.ffmpeg_manager.on_error_callback = handle_ffmpeg_error
 
         self.transcription_queue: Optional[asyncio.Queue] = asyncio.Queue() if self.args.transcription else None
-        self.diarization_queue: Optional[asyncio.Queue] = asyncio.Queue() if self.args.diarization else None
+        self.diarization_queue: Optional[asyncio.Queue] = asyncio.Queue() if self.diarization_enabled else None
         self.translation_queue: Optional[asyncio.Queue] = asyncio.Queue() if self.args.target_language else None
         self.pcm_buffer: bytearray = bytearray()
         self.total_pcm_samples: int = 0
@@ -132,15 +137,25 @@ class AudioProcessor:
         if self.args.transcription:
             self.transcription = online_factory(self.args, models.asr, language=session_language)
             self.sep = self.transcription.asr.sep
-        if self.args.diarization:
-            self.diarization = online_diarization_factory(self.args, models.diarization_model)
+        if self.diarization_enabled:
+            diarization_model = (
+                models.get_or_load_diarization()
+                if hasattr(models, 'get_or_load_diarization')
+                else getattr(models, 'diarization_model', None)
+            )
+            if diarization_model is not None:
+                self.diarization = online_diarization_factory(self.args, diarization_model)
+            else:
+                logger.warning("Diarization requested but model unavailable; disabling for this session.")
+                self.diarization_enabled = False
+                self.diarization_queue = None
         if models.translation_model:
             self.translation = online_translation_factory(self.args, models.translation_model)
 
     async def _push_silence_event(self) -> None:
         if self.transcription_queue:
             await self.transcription_queue.put(self.current_silence)
-        if self.args.diarization and self.diarization_queue:
+        if self.diarization_enabled and self.diarization_queue:
             await self.diarization_queue.put(self.current_silence)
         if self.translation_queue:
             await self.translation_queue.put(self.current_silence)
@@ -160,7 +175,7 @@ class AudioProcessor:
         start_event = Silence(is_starting=True, start=audio_t)
         if self.transcription_queue:
             await self.transcription_queue.put(start_event)
-        if self.args.diarization and self.diarization_queue:
+        if self.diarization_enabled and self.diarization_queue:
             await self.diarization_queue.put(start_event)
         if self.translation_queue:
             await self.translation_queue.put(start_event)
@@ -190,7 +205,7 @@ class AudioProcessor:
             return
         if self.transcription_queue:
             await self.transcription_queue.put(pcm_chunk.copy())
-        if self.args.diarization and self.diarization_queue:
+        if self.diarization_enabled and self.diarization_queue:
             await self.diarization_queue.put(pcm_chunk.copy())
 
     def _slice_before_silence(self, pcm_array: np.ndarray, chunk_sample_start: int, silence_sample: Optional[int]) -> Optional[np.ndarray]:
@@ -522,7 +537,7 @@ class AudioProcessor:
 
                 self.tokens_alignment.update()
                 lines, buffer_diarization_text, buffer_translation_text = self.tokens_alignment.get_lines(
-                    diarization=self.args.diarization,
+                    diarization=self.diarization_enabled,
                     translation=bool(self.translation),
                     current_silence=self.current_silence,
                     audio_time=self.total_pcm_samples / self.sample_rate if self.sample_rate else None,
@@ -542,7 +557,7 @@ class AudioProcessor:
                     buffer_diarization=buffer_diarization_text,
                     buffer_translation=buffer_translation_text,
                     remaining_time_transcription=state.remaining_time_transcription,
-                    remaining_time_diarization=state.remaining_time_diarization if self.args.diarization else 0
+                    remaining_time_diarization=state.remaining_time_diarization if self.diarization_enabled else 0
                 )
 
                 should_push = (response != self.last_response_content)
@@ -762,7 +777,7 @@ class AudioProcessor:
 
         self.total_pcm_samples = chunk_sample_end
 
-        if not self.args.transcription and not self.args.diarization:
+        if not self.args.transcription and not self.diarization_enabled:
             await asyncio.sleep(0.1)
 
     async def _flush_remaining_pcm(self) -> None:

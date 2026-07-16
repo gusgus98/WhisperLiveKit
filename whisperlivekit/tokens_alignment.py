@@ -18,7 +18,6 @@ class TokensAlignment:
 
     def __init__(self, state: Any, args: Any, sep: Optional[str]) -> None:
         self.state = state
-        self.diarization = args.diarization
 
         self.all_tokens: List[ASRToken] = []
         self.all_diarization_segments: List[SpeakerSegment] = []
@@ -251,6 +250,9 @@ class TokensAlignment:
                         ))
                 else:
                     self.current_line_tokens.append(token)
+                    if token.has_punctuation():
+                        self.validated_segments.append(Segment.from_tokens(self.current_line_tokens))
+                        self.current_line_tokens = []
 
             segments = list(self.validated_segments)
             if self.current_line_tokens:

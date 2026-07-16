@@ -455,13 +455,17 @@ class TestHarness:
         .metrics            → SessionMetrics (latency, RTF, etc.)
 
     Args:
-        All keyword arguments passed to AudioProcessor.
+        session_kwargs: Optional per-session AudioProcessor options
+            (e.g. {"language": "fr", "diarization": True}), mirroring the
+            websocket query params.
+        All other keyword arguments configure the TranscriptionEngine.
         Common: model_size, lan, backend, diarization, vac.
     """
 
-    def __init__(self, **kwargs: Any):
+    def __init__(self, session_kwargs: Optional[dict] = None, **kwargs: Any):
         kwargs.setdefault("pcm_input", True)
         self._engine_kwargs = kwargs
+        self._session_kwargs = session_kwargs or {}
         self._processor = None
         self._results_gen = None
         self._collect_task = None
@@ -485,7 +489,7 @@ class TestHarness:
 
         engine = _engine_cache[cache_key]
 
-        self._processor = AudioProcessor(transcription_engine=engine)
+        self._processor = AudioProcessor(transcription_engine=engine, **self._session_kwargs)
         self._results_gen = await self._processor.create_tasks()
         self._collect_task = asyncio.create_task(self._collect_results())
         return self

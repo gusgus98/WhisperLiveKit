@@ -74,15 +74,32 @@ async def websocket_endpoint(websocket: WebSocket):
     # Read per-session options from query parameters
     session_language = websocket.query_params.get("language", None)
     mode = websocket.query_params.get("mode", "full")
+    raw_diarization = websocket.query_params.get("diarization", None)
+    session_diarization = (
+        None if raw_diarization is None
+        else raw_diarization.lower() in ("1", "true", "yes")
+    )
+
+    # Accept first so a slow lazy model load can't time out the handshake
+    await websocket.accept()
+
+    wants_diarization = (
+        session_diarization
+        or (session_diarization is None and transcription_engine.config.diarization)
+    )
+    if wants_diarization:
+        # Pre-warm off the event loop; AudioProcessor then gets a cache hit
+        await asyncio.to_thread(transcription_engine.get_or_load_diarization)
 
     audio_processor = AudioProcessor(
         transcription_engine=transcription_engine,
         language=session_language,
+        diarization=session_diarization,
     )
-    await websocket.accept()
     logger.info(
-        "WebSocket connection opened.%s",
+        "WebSocket connection opened.%s%s",
         f" language={session_language}" if session_language else "",
+        f" diarization={session_diarization}" if session_diarization is not None else "",
     )
     diff_tracker = None
     if mode == "diff":

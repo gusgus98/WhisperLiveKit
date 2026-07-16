@@ -56,6 +56,8 @@ const themeRadios = document.querySelectorAll('input[name="theme"]');
 const microphoneSelect = document.getElementById("microphoneSelect");
 const systemAudioToggle = document.getElementById("systemAudioToggle");
 const systemAudioHint = document.getElementById("systemAudioHint");
+const languageSelect = document.getElementById("languageSelect");
+const diarizationToggle = document.getElementById("diarizationToggle");
 
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsDiv = document.querySelector(".settings");
@@ -243,6 +245,9 @@ function mergeSessionLines(incoming) {
   if (!incoming || !incoming.length) return;
   for (const line of incoming) {
     if (line == null) continue;
+    // Silence segments (speaker -2) are transient markers with no text; they
+    // are not rendered and must never accumulate in the session transcript.
+    if (line.speaker === -2) continue;
     // Key by (speaker, start_seconds) so progressive partials overwrite the
     // previous partial for the same segment instead of accumulating duplicates.
     const key = `${line.speaker ?? "?"}_${parseStartSeconds(line)}`;
@@ -371,10 +376,31 @@ websocketInput.addEventListener("change", () => {
   statusText.textContent = "WebSocket URL updated. Ready to connect.";
 });
 
+// Build the final connection URL from the (user-editable) base websocketUrl
+// plus per-session options as query params.
+function buildWebSocketUrl() {
+  let url;
+  try {
+    url = new URL(websocketUrl);
+  } catch (_) {
+    return websocketUrl;
+  }
+  const lang = languageSelect ? languageSelect.value : "auto";
+  if (lang && lang !== "auto") {
+    url.searchParams.set("language", lang);
+  }
+  if (diarizationToggle) {
+    // Send explicitly so the checkbox can also turn diarization OFF on a
+    // server started with --diarization.
+    url.searchParams.set("diarization", diarizationToggle.checked ? "true" : "false");
+  }
+  return url.toString();
+}
+
 function setupWebSocket() {
   return new Promise((resolve, reject) => {
     try {
-      websocket = new WebSocket(websocketUrl);
+      websocket = new WebSocket(buildWebSocketUrl());
     } catch (error) {
       statusText.textContent = "Invalid WebSocket URL. Please check and try again.";
       reject(error);
@@ -502,6 +528,9 @@ function renderLinesWithBuffer(
   isFinalizing = false,
   current_status = "active_transcription"
 ) {
+  // Silence segments are hidden from the transcript entirely (they also never
+  // enter sessionLines, but this render path can receive raw server lines).
+  lines = (lines || []).filter((it) => it && it.speaker !== -2);
   // Don't wipe the transcript when the server reports no_audio_detected if we
   // already have content — the server prunes lines >5 min old, and during
   // silence the response can briefly contain no lines even mid-meeting.
@@ -551,9 +580,7 @@ function renderLinesWithBuffer(
       }
 
       let speakerLabel = "";
-      if (item.speaker === -2) {
-        speakerLabel = `<span class="silence">${silenceIcon}<span id='timeInfo'>${timeInfo}</span></span>`;
-      } else if (item.speaker == 0 && !isFinalizing) {
+      if (item.speaker == 0 && !isFinalizing) {
         speakerLabel = `<span class='loading'><span class="spinner"></span><span id='timeInfo'><span class="loading-diarization-value">${fmt1(
           remaining_time_diarization
         )}</span> second(s) of audio are undergoing diarization</span></span>`;
@@ -1002,6 +1029,22 @@ if (systemAudioToggle) {
     });
   }
 }
+if (languageSelect) {
+  const savedLanguage = localStorage.getItem("languagePreference") || "auto";
+  languageSelect.value = savedLanguage;
+  if (languageSelect.value !== savedLanguage) languageSelect.value = "auto";
+  languageSelect.addEventListener("change", () => {
+    localStorage.setItem("languagePreference", languageSelect.value);
+  });
+}
+
+if (diarizationToggle) {
+  diarizationToggle.checked = localStorage.getItem("diarizationEnabled") === "1";
+  diarizationToggle.addEventListener("change", () => {
+    localStorage.setItem("diarizationEnabled", diarizationToggle.checked ? "1" : "0");
+  });
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   try {
     await enumerateMicrophones();

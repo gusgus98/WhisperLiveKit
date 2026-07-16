@@ -206,17 +206,10 @@ class TranscriptionEngine:
                     getattr(self.asr, "backend_choice", self.asr.__class__.__name__),
                 )
 
+        self.diarization_model = None
+        self._diarization_lock = threading.Lock()
         if config.diarization:
-            if config.diarization_backend == "diart":
-                from whisperlivekit.diarization.diart_backend import DiartDiarization
-                self.diarization_model = DiartDiarization(
-                    block_duration=config.min_chunk_size,
-                    segmentation_model=config.segmentation_model,
-                    embedding_model=config.embedding_model,
-                )
-            elif config.diarization_backend == "sortformer":
-                from whisperlivekit.diarization.sortformer_backend import SortformerDiarization
-                self.diarization_model = SortformerDiarization()
+            self.get_or_load_diarization()
 
         self.translation_model = None
         if config.target_language:
@@ -232,6 +225,36 @@ class TranscriptionEngine:
                     nllb_backend=config.nllb_backend,
                     nllb_size=config.nllb_size,
                 )
+
+    def get_or_load_diarization(self):
+        """Lazily load the shared diarization model (thread-safe).
+
+        Returns the model, or None if loading failed (e.g. NeMo not installed).
+        Called eagerly at startup when --diarization is set, or on demand when
+        a session requests diarization via the websocket query param.
+        """
+        if self.diarization_model is not None:
+            return self.diarization_model
+        with self._diarization_lock:
+            if self.diarization_model is not None:
+                return self.diarization_model
+            try:
+                if self.config.diarization_backend == "diart":
+                    from whisperlivekit.diarization.diart_backend import DiartDiarization
+                    self.diarization_model = DiartDiarization(
+                        block_duration=self.config.min_chunk_size,
+                        segmentation_model=self.config.segmentation_model,
+                        embedding_model=self.config.embedding_model,
+                    )
+                elif self.config.diarization_backend == "sortformer":
+                    from whisperlivekit.diarization.sortformer_backend import SortformerDiarization
+                    self.diarization_model = SortformerDiarization()
+            # sortformer_backend raises SystemExit when nemo is missing;
+            # a per-session toggle must not kill the server.
+            except BaseException as e:
+                logger.error(f"Failed to load diarization model: {e}")
+                self.diarization_model = None
+            return self.diarization_model
 
 
 def online_factory(args, asr, language=None):
@@ -275,7 +298,9 @@ def online_factory(args, asr, language=None):
         return OnlineASRProcessor(asr)
     if args.backend_policy == "simulstreaming":
         from whisperlivekit.simul_whisper import SimulStreamingOnlineProcessor
-        return SimulStreamingOnlineProcessor(asr)
+        # SimulStreaming never calls asr.transcribe(), so SessionASRProxy is a
+        # no-op for it -- the language override must be passed directly.
+        return SimulStreamingOnlineProcessor(asr, language=language)
     return OnlineASRProcessor(asr)
 
 
