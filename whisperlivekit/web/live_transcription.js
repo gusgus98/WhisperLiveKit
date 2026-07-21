@@ -228,31 +228,45 @@ async function getSystemAudioStream() {
 // Server emits start/end as formatted strings ("H:MM:SS.cc") via Segment.to_dict
 // in timed_objects.py. Parse back to seconds for keying, sorting, and timestamp
 // formatting. Tolerant of numeric input for safety in tests / future callers.
-function parseStartSeconds(line) {
-  if (!line) return 0;
-  const s = line.start;
-  if (typeof s === "number" && Number.isFinite(s)) return s;
-  if (typeof s !== "string") return 0;
-  const parts = s.split(":");
-  if (parts.length < 2) return Number(s) || 0;
+function parseTimeSeconds(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return 0;
+  const parts = value.split(":");
+  if (parts.length < 2) return Number(value) || 0;
   const sec = parseFloat(parts[parts.length - 1]) || 0;
   const min = parseInt(parts[parts.length - 2], 10) || 0;
   const hrs = parts.length >= 3 ? parseInt(parts[parts.length - 3], 10) || 0 : 0;
   return hrs * 3600 + min * 60 + sec;
 }
 
+function parseStartSeconds(line) {
+  return line ? parseTimeSeconds(line.start) : 0;
+}
+
+function parseEndSeconds(line) {
+  return line ? parseTimeSeconds(line.end) : 0;
+}
+
 function mergeSessionLines(incoming) {
-  if (!incoming || !incoming.length) return;
-  for (const line of incoming) {
-    if (line == null) continue;
-    // Silence segments (speaker -2) are transient markers with no text; they
-    // are not rendered and must never accumulate in the session transcript.
-    if (line.speaker === -2) continue;
-    // Key by (speaker, start_seconds) so progressive partials overwrite the
-    // previous partial for the same segment instead of accumulating duplicates.
-    const key = `${line.speaker ?? "?"}_${parseStartSeconds(line)}`;
-    sessionLines.set(key, line);
+  // Silence segments (speaker -2) are transient markers with no text; they are
+  // not rendered and must never accumulate in the session transcript.
+  const lines = (incoming || []).filter((it) => it && it.speaker !== -2);
+  if (!lines.length) return;
+
+  // The server rebuilds its whole line list on every update -- segments get
+  // re-split and speakers get re-attributed as diarization catches up -- so the
+  // payload is authoritative from its earliest line onward. Retained lines in
+  // that range describe an older segmentation of the same audio; keeping them
+  // leaves stale fragments interleaved with the corrected text. Only lines that
+  // end before the payload begins are ours to keep (the server prunes those).
+  const spanStart = Math.min(...lines.map(parseStartSeconds));
+  for (const [key, line] of Array.from(sessionLines)) {
+    if (parseEndSeconds(line) > spanStart) sessionLines.delete(key);
   }
+
+  // Keyed by start time alone so a re-attributed segment replaces its earlier
+  // self instead of forking into a second line under the new speaker.
+  for (const line of lines) sessionLines.set(parseStartSeconds(line), line);
 }
 
 function getSessionLinesArray() {
@@ -280,7 +294,6 @@ function buildTranscriptText() {
   const lines = getSessionLinesArray();
   const out = [];
   for (const line of lines) {
-    if (line.speaker === -2) continue; // skip silence segments
     const text = (line.text || "").trim();
     if (!text) continue;
     const startSec = parseStartSeconds(line);
@@ -1052,14 +1065,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.log("Could not enumerate microphones on load:", error);
   }
 });
-navigator.mediaDevices.addEventListener('devicechange', async () => {
-  console.log('Device change detected, re-enumerating microphones');
-  try {
-    await enumerateMicrophones();
-  } catch (error) {
-    console.log("Error re-enumerating microphones:", error);
-  }
-});
+// navigator.mediaDevices is undefined on insecure origins (e.g. reaching the
+// server by LAN IP over plain HTTP), where an unguarded access would abort the
+// rest of this script.
+if (navigator.mediaDevices) {
+  navigator.mediaDevices.addEventListener('devicechange', async () => {
+    console.log('Device change detected, re-enumerating microphones');
+    try {
+      await enumerateMicrophones();
+    } catch (error) {
+      console.log("Error re-enumerating microphones:", error);
+    }
+  });
+}
 
 
 settingsToggle.addEventListener("click", () => {

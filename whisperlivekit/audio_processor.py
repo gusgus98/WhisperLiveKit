@@ -536,11 +536,15 @@ class AudioProcessor:
                     continue
 
                 self.tokens_alignment.update()
+                # Decided before building the response so the last one emitted
+                # can flush text that is still awaiting diarization.
+                is_final_response = self.is_stopping and self._processing_tasks_done()
                 lines, buffer_diarization_text, buffer_translation_text = self.tokens_alignment.get_lines(
                     diarization=self.diarization_enabled,
                     translation=bool(self.translation),
                     current_silence=self.current_silence,
                     audio_time=self.total_pcm_samples / self.sample_rate if self.sample_rate else None,
+                    finalize=is_final_response,
                 )
                 state = await self.get_current_state()
 
@@ -566,7 +570,7 @@ class AudioProcessor:
                     yield response
                     self.last_response_content = response
 
-                if self.is_stopping and self._processing_tasks_done():
+                if is_final_response:
                     logger.info("Results formatter: All upstream processors are done and in stopping state. Terminating.")
                     return
 

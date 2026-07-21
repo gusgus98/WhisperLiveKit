@@ -1,3 +1,4 @@
+from dataclasses import replace
 from time import time
 from typing import Any, List, Optional, Tuple, Union
 
@@ -163,12 +164,15 @@ class TokensAlignment:
         """Merge consecutive diarization slices that share the same speaker."""
         if not self.all_diarization_segments:
             return []
-        merged = [self.all_diarization_segments[0]]
+        # Copy before merging: extending ``end`` in place would permanently
+        # stretch the stored segment and let it win overlap comparisons for
+        # spans it never covered.
+        merged = [replace(self.all_diarization_segments[0])]
         for segment in self.all_diarization_segments[1:]:
             if segment.speaker == merged[-1].speaker:
                 merged[-1].end = segment.end
             else:
-                merged.append(segment)
+                merged.append(replace(segment))
         return merged
 
 
@@ -180,29 +184,58 @@ class TokensAlignment:
 
         return max(0, end - start)
 
-    def get_lines_diarization(self) -> Tuple[List[Segment], str]:
-        """Build segments when diarization is enabled and track overflow buffer."""
+    def get_lines_diarization(self, finalize: bool = False) -> Tuple[List[Segment], str]:
+        """Build segments when diarization is enabled and track overflow buffer.
+
+        Args:
+            finalize: True on the last response of a session. No further update
+                will arrive to attribute deferred text, so it is emitted rather
+                than held in the buffer.
+        """
         diarization_buffer = ''
         punctuation_segments = self.compute_punctuations_segments()
         diarization_segments = self.concatenate_diar_segments()
+        diarization_frontier = diarization_segments[-1].end if diarization_segments else None
+
+        attributed_segments = []
+        last_speaker = None
         for punctuation_segment in punctuation_segments:
-            if not punctuation_segment.is_silence():
-                if diarization_segments and punctuation_segment.start >= diarization_segments[-1].end:
-                    diarization_buffer += punctuation_segment.text
-                else:
-                    max_overlap = 0.0
-                    max_overlap_speaker = 1
-                    for diarization_segment in diarization_segments:
-                        intersec = self.intersection_duration(punctuation_segment, diarization_segment)
-                        if intersec > max_overlap:
-                            max_overlap = intersec
-                            max_overlap_speaker = diarization_segment.speaker + 1
-                    punctuation_segment.speaker = max_overlap_speaker
+            if punctuation_segment.is_silence():
+                attributed_segments.append(punctuation_segment)
+                continue
+
+            # Diarization trails transcription. Text beyond the frontier has no
+            # attribution yet, so it stays in the buffer instead of being
+            # published under a guessed speaker that a later update revises --
+            # revised lines are what leave stale duplicates on the client.
+            beyond_frontier = (
+                diarization_frontier is None or punctuation_segment.start >= diarization_frontier
+            )
+            if beyond_frontier and not finalize:
+                diarization_buffer += punctuation_segment.text
+                continue
+
+            max_overlap = 0.0
+            max_overlap_speaker = None
+            for diarization_segment in diarization_segments:
+                intersec = self.intersection_duration(punctuation_segment, diarization_segment)
+                if intersec > max_overlap:
+                    max_overlap = intersec
+                    max_overlap_speaker = diarization_segment.speaker + 1
+
+            # A span inside the diarized range that still overlaps nothing (a
+            # gap, or a zero-length token) cannot be deferred without
+            # reordering the transcript, so carry the previous speaker forward.
+            if max_overlap_speaker is None:
+                max_overlap_speaker = last_speaker if last_speaker is not None else 1
+            punctuation_segment.speaker = max_overlap_speaker
+            last_speaker = max_overlap_speaker
+            attributed_segments.append(punctuation_segment)
 
         segments = []
-        if punctuation_segments:
-            segments = [punctuation_segments[0]]
-            for segment in punctuation_segments[1:]:
+        if attributed_segments:
+            segments = [attributed_segments[0]]
+            for segment in attributed_segments[1:]:
                 if segment.speaker == segments[-1].speaker:
                     if segments[-1].text:
                         segments[-1].text += segment.text
@@ -219,6 +252,7 @@ class TokensAlignment:
             translation: bool = False,
             current_silence: Optional[Silence] = None,
             audio_time: Optional[float] = None,
+            finalize: bool = False,
         ) -> Tuple[List[Segment], str, Union[str, TimedText]]:
         """Return the formatted segments plus buffers, optionally with diarization/translation.
 
@@ -226,12 +260,14 @@ class TokensAlignment:
             audio_time: Current audio stream position in seconds. Used as fallback
                 for ongoing silence end time instead of wall-clock (which breaks
                 when audio is fed faster or slower than real-time).
+            finalize: True when building the last response of a session, so that
+                text still awaiting diarization is emitted instead of buffered.
         """
         # Fallback for ongoing silence: prefer audio stream time over wall-clock
         _silence_now = audio_time if audio_time is not None else (time() - self.beg_loop)
 
         if diarization:
-            segments, diarization_buffer = self.get_lines_diarization()
+            segments, diarization_buffer = self.get_lines_diarization(finalize=finalize)
         else:
             diarization_buffer = ''
             for token in self.new_tokens:
