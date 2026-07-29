@@ -23,7 +23,6 @@ let waveCtx = waveCanvas.getContext("2d");
 let animationFrame = null;
 let waitingForStop = false;
 let lastReceivedData = null;
-let lastSignature = null;
 let availableMicrophones = [];
 let selectedMicrophoneId = null;
 let serverUseAudioWorklet = null;
@@ -40,6 +39,13 @@ let systemTrackEndedHandler = null;
 // download contain the entire meeting. Keyed by start time (number) for
 // in-place updates when a line's text grows or its speaker is reassigned.
 const sessionLines = new Map();
+// Rendered DOM node per line, keyed the same way as sessionLines, so a payload
+// only rewrites the lines that changed. See reconcileLineNodes.
+const renderedLines = new Map();
+let emptyStateShown = false;
+// How close to the bottom the reader has to be for the transcript to keep
+// following new text. Above that, their scroll position is left alone.
+const SCROLL_STICK_THRESHOLD_PX = 80;
 
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
@@ -247,26 +253,88 @@ function parseEndSeconds(line) {
   return line ? parseTimeSeconds(line.end) : 0;
 }
 
+// A zero-duration segment can leave two lines on the same start, which would
+// collide in the start-keyed session map and silently drop one. Fold them into a
+// single line so neither text is lost. Payload lines are ordered by start, so
+// colliding lines are always adjacent.
+function foldSameStartLines(lines) {
+  const out = [];
+  for (const line of lines) {
+    const prev = out[out.length - 1];
+    if (prev && parseStartSeconds(prev) === parseStartSeconds(line)) {
+      const prevText = (prev.text || "").trim();
+      const text = (line.text || "").trim();
+      out[out.length - 1] = {
+        ...line,
+        text: prevText && text ? `${prevText} ${text}` : prevText || text,
+        end: parseEndSeconds(prev) > parseEndSeconds(line) ? prev.end : line.end,
+      };
+    } else {
+      out.push(line);
+    }
+  }
+  return out;
+}
+
 function mergeSessionLines(incoming) {
   // Silence segments (speaker -2) are transient markers with no text; they are
   // not rendered and must never accumulate in the session transcript.
-  const lines = (incoming || []).filter((it) => it && it.speaker !== -2);
+  const lines = foldSameStartLines(
+    (incoming || []).filter((it) => it && it.speaker !== -2),
+  );
   if (!lines.length) return;
 
   // The server rebuilds its whole line list on every update -- segments get
   // re-split and speakers get re-attributed as diarization catches up -- so the
-  // payload is authoritative from its earliest line onward. Retained lines in
-  // that range describe an older segmentation of the same audio; keeping them
-  // leaves stale fragments interleaved with the corrected text. Only lines that
-  // end before the payload begins are ours to keep (the server prunes those).
+  // payload is authoritative for the span it covers. Classify each retained line
+  // against where that span begins:
+  //
+  //   start >= spanStart  inside the payload's span, so the server is
+  //                       re-deriving it -- drop ours, the payload wins.
+  //   start <  spanStart  either pruned away entirely, or head-cut -- ours is
+  //                       the complete copy, keep it.
+  //
+  // The old rule keyed off `end > spanStart` instead, which cannot tell a
+  // re-split apart from a head-cut and so deleted the full copy of every line
+  // the server had begun to prune.
+  //
+  // retainedReach is how far into the payload our own lines already extend.
+  // Retained lines never overlap each other, so only the one reaching furthest
+  // forward can straddle spanStart -- tracking that single number is enough, and
+  // avoids comparing every incoming line against the whole meeting.
+  // Deleting the current key while iterating a Map is well defined.
   const spanStart = Math.min(...lines.map(parseStartSeconds));
-  for (const [key, line] of Array.from(sessionLines)) {
-    if (parseEndSeconds(line) > spanStart) sessionLines.delete(key);
+  let retainedReach = -Infinity;
+  for (const [key, line] of sessionLines) {
+    if (parseStartSeconds(line) >= spanStart) sessionLines.delete(key);
+    else retainedReach = Math.max(retainedReach, parseEndSeconds(line));
   }
+
+  // A line whose head the server pruned comes back starting later and holding
+  // only its tail -- ground down a token at a time until nothing but its final
+  // "." is left. We hold that line whole and the remnant carries nothing new
+  // (tokens_alignment.py caps line length below the retention window, so a line
+  // is always published whole before its head can be cut). Admitting it would
+  // duplicate text, and at ~20 payloads a second it would pile up.
+  //
+  // Only the FIRST line of a payload can be head-cut: the prune cutoff falls at
+  // a single point in time, so every later line lies entirely after it and is
+  // complete.
+  //
+  // It counts as a remnant only when a line we kept covers its whole span --
+  // retainedReach is the furthest any of them reaches, and they all start before
+  // it. Merely overlapping is not enough: as diarization settles the server
+  // re-splits a span slightly differently, so boundaries jitter by a fraction of
+  // a second in both directions. Treating that jitter as a head-cut discards
+  // real text (measured on a real 18 min meeting: 73 words, plus 3 whole lines).
+  const admitted =
+    parseEndSeconds(lines[0]) <= retainedReach ? lines.slice(1) : lines;
 
   // Keyed by start time alone so a re-attributed segment replaces its earlier
   // self instead of forking into a second line under the new speaker.
-  for (const line of lines) sessionLines.set(parseStartSeconds(line), line);
+  for (const line of admitted) {
+    sessionLines.set(parseStartSeconds(line), line);
+  }
 }
 
 function getSessionLinesArray() {
@@ -277,7 +345,9 @@ function getSessionLinesArray() {
 
 function resetSessionLines() {
   sessionLines.clear();
-  lastSignature = null;
+  renderedLines.clear();
+  linesTranscriptDiv.innerHTML = "";
+  emptyStateShown = false;
 }
 
 function formatTimestamp(seconds) {
@@ -430,8 +500,13 @@ function setupWebSocket() {
         if (waitingForStop) {
           statusText.textContent = "Processing finalized or connection closed.";
           if (lastReceivedData) {
-          renderLinesWithBuffer(
-              lastReceivedData.lines || [],
+            // Render the whole session, not lastReceivedData.lines -- that is
+            // only the server's ~5 min window, so using it here collapsed the
+            // visible transcript to the last few minutes the moment a long
+            // meeting ended. Mirrors the ready_to_stop path below.
+            mergeSessionLines(lastReceivedData.lines || []);
+            renderLinesWithBuffer(
+              getSessionLinesArray(),
               lastReceivedData.buffer_diarization || "",
               lastReceivedData.buffer_transcription || "",
               lastReceivedData.buffer_translation || "",
@@ -549,35 +624,11 @@ function renderLinesWithBuffer(
   // silence the response can briefly contain no lines even mid-meeting.
   const hasContent = (lines && lines.length > 0) || (buffer_transcription && buffer_transcription.length > 0);
   if (current_status === "no_audio_detected" && !hasContent) {
-    linesTranscriptDiv.innerHTML =
-      "<p style='text-align: center; color: var(--muted); margin-top: 20px;'><em>No audio detected...</em></p>";
+    showEmptyState(
+      "<p style='text-align: center; color: var(--muted); margin-top: 20px;'><em>No audio detected...</em></p>",
+    );
     return;
   }
-
-  const showLoading = !isFinalizing && (lines || []).some((it) => it.speaker == 0);
-  const showTransLag = !isFinalizing && remaining_time_transcription > 0;
-  const showDiaLag = !isFinalizing && !!buffer_diarization && remaining_time_diarization > 0;
-  const signature = JSON.stringify({
-    lines: (lines || []).map((it) => ({ speaker: it.speaker, text: it.text, start: it.start, end: it.end, detected_language: it.detected_language })),
-    buffer_transcription: buffer_transcription || "",
-    buffer_diarization: buffer_diarization || "",
-    buffer_translation: buffer_translation,
-    status: current_status,
-    showLoading,
-    showTransLag,
-    showDiaLag,
-    isFinalizing: !!isFinalizing,
-  });
-  if (lastSignature === signature) {
-    const t = document.querySelector(".lag-transcription-value");
-    if (t) t.textContent = fmt1(remaining_time_transcription);
-    const d = document.querySelector(".lag-diarization-value");
-    if (d) d.textContent = fmt1(remaining_time_diarization);
-    const ld = document.querySelector(".loading-diarization-value");
-    if (ld) ld.textContent = fmt1(remaining_time_diarization);
-    return;
-  }
-  lastSignature = signature;
 
   // When there are no committed lines yet but buffer text exists (common with
   // slow backends like voxtral on MPS), render the buffer as a standalone line.
@@ -585,91 +636,182 @@ function renderLinesWithBuffer(
     ? [{ speaker: 1, text: "" }]
     : (lines || []);
 
-  const linesHtml = effectiveLines
-    .map((item, idx) => {
-      let timeInfo = "";
-      if (item.start !== undefined && item.end !== undefined) {
-        timeInfo = ` ${item.start} - ${item.end}`;
-      }
-
-      let speakerLabel = "";
-      if (item.speaker == 0 && !isFinalizing) {
-        speakerLabel = `<span class='loading'><span class="spinner"></span><span id='timeInfo'><span class="loading-diarization-value">${fmt1(
-          remaining_time_diarization
-        )}</span> second(s) of audio are undergoing diarization</span></span>`;
-      } else if (item.speaker !== 0) {
-        const speakerNum = `<span class="speaker-badge">${item.speaker}</span>`;
-        speakerLabel = `<span id="speaker">${speakerIcon}${speakerNum}<span id='timeInfo'>${timeInfo}</span></span>`;
-
-        if (item.detected_language) {
-          speakerLabel += `<span class="label_language">${languageIcon}<span>${item.detected_language}</span></span>`;
-        }
-      }
-
-      let currentLineText = item.text || "";
-
-      if (idx === effectiveLines.length - 1) {
-        if (!isFinalizing && item.speaker !== -2) {
-            speakerLabel += `<span class="label_transcription"><span class="spinner"></span>Transcription lag <span id='timeInfo'><span class="lag-transcription-value">${fmt1(
-              remaining_time_transcription
-            )}</span>s</span></span>`;
-
-          if (buffer_diarization && remaining_time_diarization) {
-            speakerLabel += `<span class="label_diarization"><span class="spinner"></span>Diarization lag<span id='timeInfo'><span class="lag-diarization-value">${fmt1(
-              remaining_time_diarization
-            )}</span>s</span></span>`;
-          }
-        }
-
-        if (buffer_diarization) {
-          if (isFinalizing) {
-            currentLineText +=
-              (currentLineText.length > 0 && buffer_diarization.trim().length > 0 ? " " : "") + buffer_diarization.trim();
-          } else {
-            currentLineText += `<span class="buffer_diarization">${buffer_diarization}</span>`;
-          }
-        }
-        if (buffer_transcription) {
-          if (isFinalizing) {
-            currentLineText +=
-              (currentLineText.length > 0 && buffer_transcription.trim().length > 0 ? " " : "") +
-              buffer_transcription.trim();
-          } else {
-            currentLineText += `<span class="buffer_transcription">${buffer_transcription}</span>`;
-          }
-        }
-      }
-      let translationContent = "";
-      if (item.translation) {
-        translationContent += item.translation.trim();
-      }
-      if (idx === effectiveLines.length - 1 && buffer_translation) {
-        const bufferPiece = isFinalizing
-          ? buffer_translation
-          : `<span class="buffer_translation">${buffer_translation}</span>`;
-        translationContent += translationContent ? `${bufferPiece}` : bufferPiece;
-      }
-      if (translationContent.trim().length > 0) {
-        currentLineText += `
-            <div>
-                <div class="label_translation">
-                    ${translationIcon}
-                    <span class="translation_text">${translationContent}</span>
-                </div>
-            </div>`;
-      }
-
-      return currentLineText.trim().length > 0 || speakerLabel.length > 0
-        ? `<p>${speakerLabel}<br/><div class='textcontent'>${currentLineText}</div></p>`
-        : `<p>${speakerLabel}<br/></p>`;
-    })
-    .join("");
-
-  linesTranscriptDiv.innerHTML = linesHtml;
+  // Measure before touching the DOM: if the reader has scrolled up to re-read
+  // something, leave them there. Only follow the transcript when they are
+  // already at the bottom.
   const transcriptContainer = document.querySelector('.transcript-container');
-  if (transcriptContainer) {
+  const stickToBottom =
+    !transcriptContainer ||
+    transcriptContainer.scrollHeight -
+      transcriptContainer.scrollTop -
+      transcriptContainer.clientHeight <
+      SCROLL_STICK_THRESHOLD_PX;
+
+  reconcileLineNodes(effectiveLines, (item, isLast) =>
+    buildLineHtml(item, isLast, {
+      buffer_diarization,
+      buffer_transcription,
+      buffer_translation,
+      remaining_time_diarization,
+      remaining_time_transcription,
+      isFinalizing,
+    }),
+  );
+
+  if (transcriptContainer && stickToBottom) {
     transcriptContainer.scrollTo({ top: transcriptContainer.scrollHeight, behavior: "smooth" });
   }
+}
+
+function buildLineHtml(item, isLast, ctx) {
+  const {
+    buffer_diarization,
+    buffer_transcription,
+    buffer_translation,
+    remaining_time_diarization,
+    remaining_time_transcription,
+    isFinalizing,
+  } = ctx;
+
+  let timeInfo = "";
+  if (item.start !== undefined && item.end !== undefined) {
+    timeInfo = ` ${item.start} - ${item.end}`;
+  }
+
+  let speakerLabel = "";
+  if (item.speaker == 0 && !isFinalizing) {
+    speakerLabel = `<span class='loading'><span class="spinner"></span><span id='timeInfo'><span class="loading-diarization-value">${fmt1(
+      remaining_time_diarization
+    )}</span> second(s) of audio are undergoing diarization</span></span>`;
+  } else if (item.speaker !== 0) {
+    const speakerNum = `<span class="speaker-badge">${item.speaker}</span>`;
+    speakerLabel = `<span id="speaker">${speakerIcon}${speakerNum}<span id='timeInfo'>${timeInfo}</span></span>`;
+
+    if (item.detected_language) {
+      speakerLabel += `<span class="label_language">${languageIcon}<span>${item.detected_language}</span></span>`;
+    }
+  }
+
+  let currentLineText = item.text || "";
+
+  if (isLast) {
+    if (!isFinalizing && item.speaker !== -2) {
+        speakerLabel += `<span class="label_transcription"><span class="spinner"></span>Transcription lag <span id='timeInfo'><span class="lag-transcription-value">${fmt1(
+          remaining_time_transcription
+        )}</span>s</span></span>`;
+
+      if (buffer_diarization && remaining_time_diarization) {
+        speakerLabel += `<span class="label_diarization"><span class="spinner"></span>Diarization lag<span id='timeInfo'><span class="lag-diarization-value">${fmt1(
+          remaining_time_diarization
+        )}</span>s</span></span>`;
+      }
+    }
+
+    if (buffer_diarization) {
+      if (isFinalizing) {
+        currentLineText +=
+          (currentLineText.length > 0 && buffer_diarization.trim().length > 0 ? " " : "") + buffer_diarization.trim();
+      } else {
+        currentLineText += `<span class="buffer_diarization">${buffer_diarization}</span>`;
+      }
+    }
+    if (buffer_transcription) {
+      if (isFinalizing) {
+        currentLineText +=
+          (currentLineText.length > 0 && buffer_transcription.trim().length > 0 ? " " : "") +
+          buffer_transcription.trim();
+      } else {
+        currentLineText += `<span class="buffer_transcription">${buffer_transcription}</span>`;
+      }
+    }
+  }
+  let translationContent = "";
+  if (item.translation) {
+    translationContent += item.translation.trim();
+  }
+  if (isLast && buffer_translation) {
+    const bufferPiece = isFinalizing
+      ? buffer_translation
+      : `<span class="buffer_translation">${buffer_translation}</span>`;
+    translationContent += translationContent ? `${bufferPiece}` : bufferPiece;
+  }
+  if (translationContent.trim().length > 0) {
+    currentLineText += `
+        <div>
+            <div class="label_translation">
+                ${translationIcon}
+                <span class="translation_text">${translationContent}</span>
+            </div>
+        </div>`;
+  }
+
+  return currentLineText.trim().length > 0 || speakerLabel.length > 0
+    ? `<p>${speakerLabel}<br/><div class='textcontent'>${currentLineText}</div></p>`
+    : `<p>${speakerLabel}<br/></p>`;
+}
+
+// Update only the lines that actually changed.
+//
+// The transcript is the whole meeting and a payload lands ~20 times a second, so
+// rebuilding every line's HTML (and re-parsing it into the DOM) made a long
+// session progressively more sluggish. Lines outside the server's ~5 min window
+// are never touched by mergeSessionLines, so their object identity is stable and
+// they can be skipped with a single === -- the per-message work becomes
+// proportional to what changed, not to how long the meeting has run.
+function reconcileLineNodes(items, buildHtml) {
+  clearEmptyState();
+
+  const wanted = new Set();
+  let previousNode = null;
+
+  items.forEach((item, idx) => {
+    const isLast = idx === items.length - 1;
+    const key = parseStartSeconds(item);
+    wanted.add(key);
+
+    let entry = renderedLines.get(key);
+    // The last line carries the live buffers and lag counters, so it is rebuilt
+    // every time; the rest only when their data actually changed.
+    if (!entry || entry.item !== item || entry.isLast !== isLast || isLast) {
+      const html = buildHtml(item, isLast);
+      if (!entry) {
+        const el = document.createElement("div");
+        el.className = "transcript-line";
+        el.innerHTML = html;
+        entry = { el, html, item, isLast };
+        renderedLines.set(key, entry);
+      } else {
+        if (entry.html !== html) {
+          entry.el.innerHTML = html;
+          entry.html = html;
+        }
+        entry.item = item;
+        entry.isLast = isLast;
+      }
+    }
+
+    const expected = previousNode ? previousNode.nextSibling : linesTranscriptDiv.firstChild;
+    if (entry.el !== expected) linesTranscriptDiv.insertBefore(entry.el, expected);
+    previousNode = entry.el;
+  });
+
+  for (const [key, entry] of Array.from(renderedLines)) {
+    if (wanted.has(key)) continue;
+    if (entry.el.parentNode) entry.el.parentNode.removeChild(entry.el);
+    renderedLines.delete(key);
+  }
+}
+
+function showEmptyState(html) {
+  renderedLines.clear();
+  linesTranscriptDiv.innerHTML = html;
+  emptyStateShown = true;
+}
+
+function clearEmptyState() {
+  if (!emptyStateShown) return;
+  linesTranscriptDiv.innerHTML = "";
+  emptyStateShown = false;
 }
 
 function updateTimer() {

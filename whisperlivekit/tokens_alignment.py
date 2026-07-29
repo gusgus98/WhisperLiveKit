@@ -14,6 +14,15 @@ from whisperlivekit.timed_objects import (
 
 _DEFAULT_RETENTION_SECONDS: float = 300.0
 
+# A line arrives at the client as a single blob of text with no internal
+# timestamps, so once ``_prune`` starts eating its head the client cannot tell
+# which words are new. Capping line length below the retention window means every
+# line is published whole at least once before that can happen, and the client
+# never has to reconcile a partial line.
+#
+# Required: _MAX_LINE_SECONDS + longest sentence + diarization lag < _DEFAULT_RETENTION_SECONDS.
+_MAX_LINE_SECONDS: float = 120.0
+
 
 class TokensAlignment:
 
@@ -236,7 +245,7 @@ class TokensAlignment:
         if attributed_segments:
             segments = [attributed_segments[0]]
             for segment in attributed_segments[1:]:
-                if segment.speaker == segments[-1].speaker:
+                if segment.speaker == segments[-1].speaker and self._same_block(segment, segments[-1]):
                     if segments[-1].text:
                         segments[-1].text += segment.text
                     segments[-1].end = segment.end
@@ -244,6 +253,24 @@ class TokensAlignment:
                     segments.append(segment)
 
         return segments, diarization_buffer
+
+    @staticmethod
+    def _same_block(segment: TimedText, line: TimedText) -> bool:
+        """Whether ``segment`` may extend ``line``, or starts a new one.
+
+        Blocks are cut on a grid of absolute audio time so that a boundary lands
+        in the same place no matter which tokens ``_prune`` has already dropped.
+        Do NOT rewrite this as ``segment.end - line.start > _MAX_LINE_SECONDS``:
+        measuring from the line's own start re-anchors every boundary as the head
+        is eaten, which re-cuts whole lines under the client and reintroduces the
+        very ambiguity the cap exists to remove.
+
+        The cut falls between two punctuation segments, so a sentence is never
+        split mid-way -- though the segment it follows is not always punctuated
+        (``compute_punctuations_segments`` also emits silence and leftover-tail
+        segments).
+        """
+        return int(segment.start // _MAX_LINE_SECONDS) == int(line.start // _MAX_LINE_SECONDS)
 
 
     def get_lines(
