@@ -20,8 +20,31 @@ _DEFAULT_RETENTION_SECONDS: float = 300.0
 # line is published whole at least once before that can happen, and the client
 # never has to reconcile a partial line.
 #
-# Required: _MAX_LINE_SECONDS + longest sentence + diarization lag < _DEFAULT_RETENTION_SECONDS.
+# Required: _MAX_LINE_SECONDS + diarization lag < _DEFAULT_RETENTION_SECONDS.
+#
+# The cap is enforced on tokens (``_crosses_line_boundary``), not on punctuation
+# segments, so no term here depends on the ASR's sentence length. It used to, and
+# an ASR run that emitted no punctuation for 11 minutes made that term unbounded.
 _MAX_LINE_SECONDS: float = 120.0
+
+
+def _crosses_line_boundary(previous: TimedText, token: TimedText) -> bool:
+    """Whether a line must be cut between two adjacent tokens.
+
+    Punctuation cannot be the only thing that bounds a line. An ASR run may emit
+    none at all -- large-v3 produced 46,440 words with no ``.?!`` and no comma over
+    the first 11 minutes of a real session -- and with nothing to cut on, every
+    token lands in one segment that grows until ``_prune`` starts eating its head.
+    The client cannot repair a head-cut line, so it admits each re-send as a new
+    line and the transcript multiplies (that session downloaded as 1.6 MB, 212
+    near-copies of the same 7.4 KB line).
+
+    Cut on the same absolute-time grid as ``_same_block``. Comparing the two
+    adjacent tokens -- rather than the token against the line's start -- is what
+    keeps the boundary stable while the head is being eaten: the line's start moves
+    as tokens are dropped, but the boundary between these two does not.
+    """
+    return int(token.start // _MAX_LINE_SECONDS) != int(previous.start // _MAX_LINE_SECONDS)
 
 
 class TokensAlignment:
@@ -113,6 +136,16 @@ class TokensAlignment:
         segments = []
         segment_start_idx = 0
         for i, token in enumerate(self.all_tokens):
+            # @sync(line-boundary-split): also the non-diarization branch of
+            # get_lines. compute_new_punctuations_segments carries the same cut but
+            # has no callers, so it is not counted here.
+            if i > segment_start_idx and _crosses_line_boundary(self.all_tokens[i - 1], token):
+                segment = PuncSegment.from_tokens(
+                    tokens=self.all_tokens[segment_start_idx: i],
+                )
+                if segment:
+                    segments.append(segment)
+                segment_start_idx = i
             if token.is_silence():
                 previous_segment = PuncSegment.from_tokens(
                         tokens=self.all_tokens[segment_start_idx: i],
@@ -145,6 +178,18 @@ class TokensAlignment:
         segment_start_idx = 0
         self.unvalidated_tokens += self.new_tokens
         for i, token in enumerate(self.unvalidated_tokens):
+            # Unreferenced as of this change, so not part of the @sync group and
+            # not covered by a test -- kept in step with compute_punctuations_segments
+            # so it is not silently wrong if it is ever wired up.
+            if i > segment_start_idx and _crosses_line_boundary(
+                self.unvalidated_tokens[i - 1], token
+            ):
+                segment = PuncSegment.from_tokens(
+                    tokens=self.unvalidated_tokens[segment_start_idx: i],
+                )
+                if segment:
+                    new_punc_segments.append(segment)
+                segment_start_idx = i
             if token.is_silence():
                 previous_segment = PuncSegment.from_tokens(
                         tokens=self.unvalidated_tokens[segment_start_idx: i],
@@ -265,10 +310,12 @@ class TokensAlignment:
         is eaten, which re-cuts whole lines under the client and reintroduces the
         very ambiguity the cap exists to remove.
 
-        The cut falls between two punctuation segments, so a sentence is never
-        split mid-way -- though the segment it follows is not always punctuated
-        (``compute_punctuations_segments`` also emits silence and leftover-tail
-        segments).
+        Segments reaching here are already cut on this grid by
+        ``_crosses_line_boundary``, so this only decides whether two segments in the
+        same cell may be joined; it never has to cut one. A sentence straddling a
+        cell boundary is split, which costs a line break mid-sentence roughly once
+        every ``_MAX_LINE_SECONDS`` -- the price of a bound that does not depend on
+        the ASR emitting punctuation at all.
         """
         return int(segment.start // _MAX_LINE_SECONDS) == int(line.start // _MAX_LINE_SECONDS)
 
@@ -312,6 +359,14 @@ class TokensAlignment:
                             end=end_silence
                         ))
                 else:
+                    # @sync(line-boundary-split)
+                    if self.current_line_tokens and _crosses_line_boundary(
+                        self.current_line_tokens[-1], token
+                    ):
+                        self.validated_segments.append(
+                            Segment.from_tokens(self.current_line_tokens)
+                        )
+                        self.current_line_tokens = []
                     self.current_line_tokens.append(token)
                     if token.has_punctuation():
                         self.validated_segments.append(Segment.from_tokens(self.current_line_tokens))

@@ -43,8 +43,15 @@ class _State:
         self.new_translation_buffer = TimedText()
 
 
-def _build_meeting():
-    """Sentences of ~4s, speaker turns every ~40s, one long monologue in the middle."""
+def _build_meeting(punctuate: bool = True):
+    """Sentences of ~4s, speaker turns every ~40s, one long monologue in the middle.
+
+    ``punctuate=False`` reproduces an ASR run that emits none at all. Whisper
+    large-v3 did exactly that for the first ~11 minutes of a real session --
+    46,440 words with zero ``.?!`` and zero commas -- and punctuation was the only
+    thing cutting lines, so the whole span became one line that grew until
+    ``_prune`` started eating its head.
+    """
     tokens = []
     turns = []
     t = 0.0
@@ -55,7 +62,7 @@ def _build_meeting():
         in_monologue = MONOLOGUE[0] <= t < MONOLOGUE[1]
         for w in range(6):
             text = f"w{len(tokens)}"
-            if w == 5:
+            if w == 5 and punctuate:
                 text += "."
             tokens.append(ASRToken(start=t, end=t + 0.6, text=text + " "))
             t += 0.65
@@ -80,14 +87,15 @@ def _build_meeting():
     return tokens, diarization
 
 
-def _capture_payloads():
+def _capture_payloads(punctuate: bool = True, diarization: bool = True):
     """Return (payload sequence, ground truth text) for the simulated meeting."""
-    tokens, diarization = _build_meeting()
+    tokens, diar_segments = _build_meeting(punctuate=punctuate)
     state = _State()
     alignment = TokensAlignment(state, None, sep="")
 
     events = [(tok.end, "token", tok) for tok in tokens]
-    events += [(seg.end + DIAR_LAG, "diar", seg) for seg in diarization]
+    if diarization:
+        events += [(seg.end + DIAR_LAG, "diar", seg) for seg in diar_segments]
     events.sort(key=lambda e: e[0])
 
     payloads = []
@@ -97,7 +105,9 @@ def _capture_payloads():
         else:
             state.new_diarization.append(item)
         alignment.update()
-        lines, _buffer, _translation = alignment.get_lines(diarization=True, audio_time=when)
+        lines, _buffer, _translation = alignment.get_lines(
+            diarization=diarization, audio_time=when
+        )
         payloads.append([segment.to_dict() for segment in lines])
 
     return payloads, "".join(tok.text for tok in tokens)
@@ -178,12 +188,7 @@ def _replay_in_browser_logic(payloads):
     return json.loads(result.stdout)
 
 
-def test_long_meeting_transcript_survives_server_pruning():
-    payloads, ground_truth = _capture_payloads()
-    assert len(payloads) > 1000, "simulation should produce a realistic payload stream"
-
-    rendered = _replay_in_browser_logic(payloads)
-
+def _assert_transcript_intact(rendered, ground_truth):
     spoken = ground_truth.split()
     kept = rendered["text"].split()
 
@@ -210,24 +215,80 @@ def test_long_meeting_transcript_survives_server_pruning():
     assert extra <= len(spoken) * 0.02, f"{extra} duplicated words of {len(spoken)}"
 
 
+def _longest_line_seconds(payloads):
+    def seconds(value):
+        hours, minutes, secs = value.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(secs)
+
+    return max(
+        seconds(line["end"]) - seconds(line["start"])
+        for payload in payloads
+        for line in payload
+    )
+
+
+def test_long_meeting_transcript_survives_server_pruning():
+    payloads, ground_truth = _capture_payloads()
+    assert len(payloads) > 1000, "simulation should produce a realistic payload stream"
+
+    _assert_transcript_intact(_replay_in_browser_logic(payloads), ground_truth)
+
+
 def test_no_line_outlives_the_retention_window():
     """The guarantee the browser-side fix relies on: lines are always sent whole."""
     from whisperlivekit.tokens_alignment import _DEFAULT_RETENTION_SECONDS
 
     payloads, _ = _capture_payloads()
-
-    def seconds(value):
-        hours, minutes, secs = value.split(":")
-        return int(hours) * 3600 + int(minutes) * 60 + float(secs)
-
-    longest = max(
-        seconds(line["end"]) - seconds(line["start"])
-        for payload in payloads
-        for line in payload
-    )
+    longest = _longest_line_seconds(payloads)
     # Slack between the longest line and the prune cutoff is the diarization lag
     # budget -- a line must be complete before its head starts being eaten.
     assert longest < _DEFAULT_RETENTION_SECONDS / 2, f"longest line was {longest:.0f}s"
+
+
+def test_unpunctuated_asr_output_is_still_cut_into_lines():
+    """Punctuation is not a guarantee, so it cannot be the only thing bounding a line.
+
+    Regression guard for a 1.6 MB download of a 42 min meeting: large-v3 emitted
+    46,440 words with no ``.?!`` at all, nothing cut the line, and once it outgrew
+    the retention window ``_prune`` re-sent it head-cut on every payload.
+    """
+    from whisperlivekit.tokens_alignment import _DEFAULT_RETENTION_SECONDS
+
+    payloads, _ = _capture_payloads(punctuate=False)
+    longest = _longest_line_seconds(payloads)
+    assert longest < _DEFAULT_RETENTION_SECONDS / 2, f"longest line was {longest:.0f}s"
+
+
+@pytest.mark.parametrize("punctuate", [True, False])
+def test_lines_are_bounded_without_diarization(punctuate):
+    """The non-diarization path builds lines from its own persistent state.
+
+    ``validated_segments`` and ``current_line_tokens`` carry across calls and are
+    pruned in place, so sharing a cut predicate with the diarization path is not on
+    its own evidence that it behaves the same. Assert it directly.
+    """
+    from whisperlivekit.tokens_alignment import _DEFAULT_RETENTION_SECONDS
+
+    payloads, _ = _capture_payloads(punctuate=punctuate, diarization=False)
+    longest = _longest_line_seconds(payloads)
+    assert longest < _DEFAULT_RETENTION_SECONDS / 2, f"longest line was {longest:.0f}s"
+
+
+def test_unpunctuated_output_does_not_multiply_lines_on_the_client():
+    """The download blowing up is what the user actually sees, so assert on that.
+
+    A line the server keeps re-sending with a later start lands as a *new* entry in
+    the start-keyed session map every time, so the transcript grows with the payload
+    count rather than with the meeting.
+    """
+    payloads, ground_truth = _capture_payloads(punctuate=False)
+    rendered = _replay_in_browser_logic(payloads)
+
+    assert rendered["lineCount"] < len(payloads) / 10, (
+        f"{rendered['lineCount']} lines kept from {len(payloads)} payloads -- "
+        "head-cut re-sends are accumulating instead of replacing"
+    )
+    _assert_transcript_intact(rendered, ground_truth)
 
 
 if __name__ == "__main__":
